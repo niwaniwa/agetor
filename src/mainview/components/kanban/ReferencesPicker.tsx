@@ -7,6 +7,8 @@ import { iconForRef, refBasename } from "@/lib/file-icons";
 import { captureDroppedOrPastedItems } from "@/lib/capture-refs";
 import type { CaptureResult } from "@/lib/capture-refs";
 import { api } from "@/lib/api";
+import { browserMode } from "@/lib/transport";
+import { ServerPathDialog } from "@/components/ServerPathDialog";
 import type { TaskReference } from "../../../shared/types.ts";
 
 export { captureDroppedOrPastedItems, type CapturedItem, type CaptureResult } from "@/lib/capture-refs";
@@ -76,6 +78,8 @@ export function ReferencesPicker({
   const [dragging, setDragging] = useState(false);
   const [picking, setPicking] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
+  const [serverPathOpen, setServerPathOpen] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
   // Local open state for the expandable variant. We auto-open the section
   // the first time refs flip from empty → non-empty so adding the first
   // file reveals the list — but never force it open afterwards, so the
@@ -97,6 +101,11 @@ export function ReferencesPicker({
   // `<input type=file>` can't give us a real path — the native panel can.
   const pick = async (mode: "files" | "folder") => {
     if (picking) return;
+    if (browserMode) {
+      if (mode === "files") fileInput.current?.click();
+      else setServerPathOpen(true);
+      return;
+    }
     setHint(null);
     setPicking(true);
     try {
@@ -169,6 +178,29 @@ export function ReferencesPicker({
   // collapses/expands the section.
   const buttons = (
     <div className="flex items-center gap-1">
+      {browserMode && <>
+        <input ref={fileInput} className="hidden" type="file" multiple aria-label="Upload files" onClick={(e) => e.stopPropagation()} onChange={async (e) => {
+          const files = Array.from(e.target.files ?? []);
+          e.target.value = "";
+          if (!files.length) return;
+          setPicking(true);
+          setHint(null);
+          const uploaded: TaskReference[] = [];
+          try {
+            for (const file of files) {
+              const result = await api.uploadAttachment(file, file.name);
+              uploaded.push({ path: result.path, isDirectory: false });
+            }
+          } catch (error) { setHint(`Couldn't attach: ${(error as Error).message}`); }
+          finally { append(uploaded); setPicking(false); }
+        }} />
+        <ServerPathDialog open={serverPathOpen} title="Attach server directory" initialPath={startingFolder} onClose={() => setServerPathOpen(false)} onSelect={async (path) => {
+          if (!path.startsWith("/")) throw new Error("Enter an absolute server path.");
+          const resolved = await api.resolveRefs([path]);
+          if (!resolved.length || !resolved[0]?.isDirectory) throw new Error("Server directory does not exist.");
+          append(resolved);
+        }} />
+      </>}
       <Button
         type="button"
         variant="ghost"
@@ -178,7 +210,7 @@ export function ReferencesPicker({
         className="h-6 gap-1 px-2 text-[11px]"
         onClick={(e) => { e.stopPropagation(); void pick("files"); }}
       >
-        <FilePlus className="size-3" /> Files
+        <FilePlus className="size-3" /> {browserMode ? "Upload files" : "Files"}
       </Button>
       <Button
         type="button"
@@ -189,7 +221,7 @@ export function ReferencesPicker({
         className="h-6 gap-1 px-2 text-[11px]"
         onClick={(e) => { e.stopPropagation(); void pick("folder"); }}
       >
-        <FolderPlus className="size-3" /> Folder
+        <FolderPlus className="size-3" /> {browserMode ? "Server folder" : "Folder"}
       </Button>
     </div>
   );

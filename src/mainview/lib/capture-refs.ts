@@ -1,5 +1,6 @@
 import type { TaskReference } from "../../shared/types.ts";
 import { api } from "./api";
+import { browserMode } from "./transport";
 import { refBasename } from "./path";
 
 // Deliberately narrower than `isImagePath` (shared/attachments.ts, 10
@@ -164,6 +165,8 @@ export type DragRefsFetcher = () => Promise<TaskReference[]>;
 export type AttachmentUploader = (blob: Blob, name: string) => Promise<{ path: string; basename: string }>;
 
 export interface CaptureOptions {
+  /** Browser-local paths are never server references. Defaults to browserMode. */
+  remoteHost?: boolean;
   /** `"drop"` (default) enables the drag-pasteboard recovery step below;
    *  `"paste"` never consults it — see the flow comment for why. */
   kind?: "drop" | "paste";
@@ -262,6 +265,7 @@ export async function captureDroppedOrPastedItems(
   opts: CaptureOptions = {},
 ): Promise<CaptureResult> {
   const kind = opts.kind ?? "drop";
+  const remoteHost = opts.remoteHost ?? browserMode;
   const uploader = opts.uploader ?? api.uploadScreenshot;
   const resolver = opts.resolver ?? api.resolveRefs;
   const dragRefsFn = opts.dragRefs ?? api.dragRefs;
@@ -276,7 +280,7 @@ export async function captureDroppedOrPastedItems(
   // Drop transient (temp-dir) URLs so a screenshot-thumbnail drag falls
   // through to the blob-upload path below rather than referencing a file
   // that may vanish — see `isTransientPath`.
-  const filePaths = extractFilePaths(source).filter((p) => !isTransientPath(p));
+  const filePaths = remoteHost ? [] : extractFilePaths(source).filter((p) => !isTransientPath(p));
 
   if (filePaths.length) {
     try {
@@ -293,7 +297,7 @@ export async function captureDroppedOrPastedItems(
   const draggedItems: CapturedItem[] = [];
   const consumed = new Set<number>();
   const carriedFiles = collected.length > 0 || typesSnapshot.includes("Files");
-  if (kind === "drop" && carriedFiles) {
+  if (!remoteHost && kind === "drop" && carriedFiles) {
     try {
       const dragged = await dragRefsFn();
       // Only the four types `POST /screenshots` can actually take stay on
@@ -357,7 +361,7 @@ export async function captureDroppedOrPastedItems(
   for (let i = 0; i < collected.length; i++) {
     if (consumed.has(i)) continue;
     const { file: f, isDirectory } = collected[i]!;
-    if (f.path) {
+    if (!remoteHost && f.path) {
       pending.push(Promise.resolve({
         ref: { path: f.path, isDirectory },
         basename: refBasename(f.path),

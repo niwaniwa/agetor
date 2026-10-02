@@ -50,7 +50,7 @@ import {
  * flight; between turns there is nothing to reattach (and nothing running).
  *
  * Capture mechanism: rather than scrape the tmux pane, we wrap the codex argv
- * in `sh -c 'exec <argv> < <prompt-file> > <log-file> 2>&1'`. codex's `--json`
+ * in `sh -c '<argv> < <prompt-file> > <log-file> 2>&1; …'`. codex's `--json`
  * stdout is redirected straight to a file we own, so the tail is a clean,
  * re-readable NDJSON stream (no pane decoration, no race), and the prompt is
  * delivered via stdin (the trailing `-` in the argv) so no user text ever
@@ -476,7 +476,14 @@ export async function spawnCodexViaTmux(opts: CodexLaunchOptions): Promise<Spawn
   await killSessionByName(sessionName);
 
   const tmux = resolveTmuxBin();
-  const inner = `exec ${opts.argv.map(sq).join(" ")} < ${sq(promptPath)} > ${sq(logPath)} 2>&1`;
+  // Keep the wrapper shell's PTY descriptors open while Codex uses files.
+  // On Linux, exec'ing with all three descriptors redirected closes the
+  // last PTY slave and sends SIGHUP before Codex emits its first event. The
+  // trailing exit forwarding prevents a shell from optimizing the last
+  // command into exec, and does not depend on the CLI retaining extra fds.
+  // tmux cancellation still signals the foreground process group, including
+  // both this shell and Codex.
+  const inner = `${opts.argv.map(sq).join(" ")} < ${sq(promptPath)} > ${sq(logPath)} 2>&1; codex_status=$?; exit "$codex_status"`;
   const envArgs: string[] = [];
   // Forward PATH so codex's own shell-tool invocations resolve dev binaries,
   // plus the harness env (CODEX_HOME/HOME) that controls codex's login/history.
@@ -569,16 +576,20 @@ export interface CodexReattachOptions {
   /** Dedup keys already persisted for this task's runs, so re-reading the log
    *  from offset 0 doesn't double-emit events streamed before the restart. */
   seenLineUuids: Set<string>;
+  /** Recover thread.started even if the service stopped before persisting it. */
+  onSessionId?: (id: string) => void;
 }
 
 /**
- * Reattach to a codex turn whose tmux session survived an agetor restart.
+ * Recover a codex turn after a service restart, including one that completed
+ * while the service was stopped. The per-run JSONL is authoritative for a
+ * terminal result even after the one-shot tmux session has disappeared.
  * Re-tails the run's log from offset 0 (deduping via `seenLineUuids`) and
  * resolves `done` when the turn finishes. Returns null when the session is no
- * longer alive (caller should orphan the run).
+ * longer alive and its log has no terminal result (caller should orphan it).
  */
 export async function reattachCodexSession(opts: CodexReattachOptions): Promise<SpawnedAgent | null> {
-  if (!(await sessionExistsByName(opts.sessionName))) return null;
+  const live = await sessionExistsByName(opts.sessionName);
   const state: CodexSessionState = {
     taskId: opts.taskId,
     runId: opts.runId,
@@ -593,12 +604,19 @@ export async function reattachCodexSession(opts: CodexReattachOptions): Promise<
     seenLineUuids: opts.seenLineUuids,
     seq: { n: 0 },
     onChunk: opts.onChunk,
-    onSessionId: undefined,
-    sessionIdSent: true, // thread id already persisted on the original run
+    onSessionId: opts.onSessionId,
+    sessionIdSent: false,
     resolved: false,
     lastCode: null,
     resolveDone: () => { /* replaced in startCodexTailer */ },
   };
+  if (!live) {
+    // No timers or new CLI are needed to recover a completed offline turn.
+    // Replay also preserves diagnostic output from a crashed, incomplete turn.
+    flushCodexLog(state);
+    if (!state.resolved) return null;
+    return { kill: () => {}, writeInput: () => false, done: Promise.resolve(state.lastCode ?? 1) };
+  }
   const done = startCodexTailer(state);
   return {
     kill: () => killCodexState(state),

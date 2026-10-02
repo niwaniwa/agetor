@@ -28,7 +28,14 @@ import {
   resolveAnchoredMinId,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
-import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, hasPendingDoneFollowupWork, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import {
+  getDoneFollowupSummary,
+  isDoneFollowupsEligible,
+  markTaskDoneAndQueueFollowups,
+  processDoneFollowupRequest,
+  retryDoneFollowupRequest,
+} from "./done-followups.ts";
 import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
@@ -415,7 +422,7 @@ function authed<F extends (req: any) => Response | Promise<Response>>(fn: F): F 
  * task is bound to a profile, until it's detached.
  */
 const ALLOWED_PATCH_FIELDS = new Set<keyof Task>([
-  "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "fast", "maxMode", "taskType",
+  "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "fast", "maxMode", "taskType", "doneFollowupsEnabled",
 ]);
 
 /** The 8 reaction contents GitHub's API accepts — validated here before the
@@ -435,9 +442,31 @@ function filterPatch(raw: unknown): Partial<Task> {
       patch.maxMode = v === true;
       continue;
     }
+    if (k === "doneFollowupsEnabled" && typeof v === "boolean") {
+      patch.doneFollowupsEnabled = v;
+      continue;
+    }
     if (ALLOWED_PATCH_FIELDS.has(k as keyof Task)) (patch as Record<string, unknown>)[k] = v;
   }
   return patch;
+}
+
+/** The DB-only follow-up service asks its caller for live-state facts so it
+ * never imports the orchestrator (and therefore cannot create an import
+ * cycle). Draft/backlog text is intentionally excluded by the orchestrator
+ * predicate; only executable work blocks a Done-time materialization. */
+function doneFollowupsRuntime() {
+  return {
+    resolveAgentKind: (task: Task) => harnesses.getByIdOrKind(task.agent)?.kind ?? null,
+    hasPendingWork: (task: Task) => hasPendingDoneFollowupWork(task.id),
+  };
+}
+
+function doneFollowupsAllowedForTask(task: Pick<Task, "agent" | "pipelineId" | "pipelineParentId" | "doneFollowupsEnabled">): boolean {
+  return isDoneFollowupsEligible(
+    task,
+    harnesses.getByIdOrKind(task.agent)?.kind ?? null,
+  ).ok;
 }
 
 /** Shared precondition for the backlog-mutation routes: the task must exist
@@ -916,6 +945,9 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           }
           if (!existsSync(p)) {
             return json({ error: `path does not exist: ${p}` }, { status: 404, headers: corsHeaders(req) });
+          }
+          if (!statSync(p).isDirectory()) {
+            return json({ error: "path must be a directory" }, { status: 400, headers: corsHeaders(req) });
           }
           const name =
             typeof body.name === "string" && body.name.trim()
@@ -4329,6 +4361,12 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               { status: 400, headers: corsHeaders(req) },
             );
           }
+          if (body.doneFollowupsEnabled !== undefined && typeof body.doneFollowupsEnabled !== "boolean") {
+            return json(
+              { error: "doneFollowupsEnabled must be a boolean" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
           if (body.issueUrl !== undefined && typeof body.issueUrl !== "string") {
             return json({ error: "issueUrl must be a string" }, { status: 400, headers: corsHeaders(req) });
           }
@@ -4422,7 +4460,19 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          const patch = filterPatch(await req.json());
+          const rawPatch = await req.json();
+          if (
+            rawPatch
+            && typeof rawPatch === "object"
+            && Object.prototype.hasOwnProperty.call(rawPatch, "doneFollowupsEnabled")
+            && typeof (rawPatch as Record<string, unknown>).doneFollowupsEnabled !== "boolean"
+          ) {
+            return json(
+              { error: "doneFollowupsEnabled must be a boolean" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const patch = filterPatch(rawPatch);
           // A pipeline step task's `column` is managed entirely by the
           // pipeline runner (D9, docs/plans/pipelines.md) — it flips as the
           // step's own run settles, and letting a direct PATCH drag it to a
@@ -4489,6 +4539,21 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               { status: 400, headers: corsHeaders(req) },
             );
           }
+          // Do not let a direct caller enable collection for a Pipeline or an
+          // unsupported harness. If an already-enabled task changes agent,
+          // it must explicitly turn the setting off in the same PATCH.
+          if (
+            patch.doneFollowupsEnabled === true
+            || (typeof patch.agent === "string" && before.doneFollowupsEnabled === true && patch.doneFollowupsEnabled !== false)
+          ) {
+            const candidate = { ...before, ...patch };
+            if (!doneFollowupsAllowedForTask(candidate)) {
+              return json(
+                { error: "Done follow-up tasks are available only for ordinary Claude Code or Codex tasks" },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+          }
           // Enforce the "model is always set, effort is set unless the
           // model declines it" invariant at the PATCH boundary so direct
           // API callers can't reintroduce nulls that `buildCommand` would
@@ -4545,6 +4610,32 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               }
             }
           }
+          // Card buttons and drag-and-drop both arrive here. Keep the Done
+          // column mutation and durable request registration in the service's
+          // one SQLite transaction; only after that commit may the in-process
+          // worker materialize its saved candidates. A retry/duplicate Done
+          // therefore cannot create a second task set.
+          if (patch.column === "done") {
+            const done = markTaskDoneAndQueueFollowups({
+              taskId: req.params.id,
+              beforeDonePatch: patch,
+              ...doneFollowupsRuntime(),
+            });
+            if (done.status === "not-found") {
+              return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+            }
+            if (done.status === "queued" || done.status === "already-queued") {
+              // Intentionally ignore a materialization result here: a failed
+              // request is durable and visible through GET/retry, while Done
+              // itself remains successful exactly as the product contract
+              // requires.
+              processDoneFollowupRequest({ requestId: done.request.id, ...doneFollowupsRuntime() });
+            }
+            reconcileTaskSession(req.params.id, before, done.task).catch((err: unknown) => {
+              console.error("reconcileTaskSession failed:", err);
+            });
+            return json(withRunningSubagents(done.task), { headers: corsHeaders(req) });
+          }
           const updated = tasks.update(req.params.id, patch);
           if (!updated) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -4588,6 +4679,34 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           server.timeout(req, 0);
           await deleteTask(req.params.id);
           return new Response(null, { status: 204, headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/done-followups": {
+        GET: authed((req) => {
+          const summary = getDoneFollowupSummary(req.params.id);
+          return summary
+            ? json(summary, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/done-followups/retry": {
+        POST: authed((req) => {
+          const summary = getDoneFollowupSummary(req.params.id);
+          if (!summary) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          // Only a stored materialization failure is retryable. Retrying is
+          // deliberately not a collection operation and never starts a CLI.
+          if (!summary.request || summary.request.status !== "failed") {
+            return json(
+              { error: "there is no failed follow-up creation to retry" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          retryDoneFollowupRequest(summary.request.id, doneFollowupsRuntime());
+          return json(getDoneFollowupSummary(req.params.id)!, { headers: corsHeaders(req) });
         }),
       },
 
@@ -4993,6 +5112,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               },
               { status: 404, headers: corsHeaders(req) },
             );
+          }
+          if (!native) {
+            const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+            const command = [tmuxPath, ...tmuxSocketArgs(), "attach", "-t", sessionName].map(quote).join(" ");
+            return json({ ok: true, sessionName, command }, { headers: corsHeaders(req) });
           }
           // Heal a stuck `window-size manual` pin (a prior crash mid pane-grow)
           // before attaching, so the client's own size wins instead of being

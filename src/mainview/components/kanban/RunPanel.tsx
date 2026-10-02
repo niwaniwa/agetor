@@ -7,6 +7,8 @@ import {
   Sparkles, Square, Terminal, Trash2, Workflow, Wrench, X,
 } from "lucide-react";
 import { api, ApiError, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
+import { browserMode } from "@/lib/transport";
+import { replayWindowHasGap } from "@/lib/replay-window";
 import { resolveTaskProfileDisplay, type TaskProfileDisplay } from "@/lib/agent-profiles";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs, anySubagentRunning } from "@/lib/subagent-tabs";
 import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
@@ -86,6 +88,7 @@ import {
   type TaskDraft,
   type TaskEventsReplayMeta,
   type TaskFxRecovery,
+  type DoneFollowupSummary,
   type TaskPlan,
   type TaskReference,
   type ToolResultAttachment,
@@ -256,6 +259,10 @@ interface Props {
    *  `docs/plans/pipelines.md`). Defaults to a no-op so `RunPanel` compiles
    *  and renders standalone before `App.tsx` threads the real handler. */
   onOpenPipeline?: (parentTaskId: string) => void;
+  /** Opens a task referred to by a persisted Done-followup relation. The
+   *  App owner resolves an id against its fresh task list so generated tasks
+   *  remain reachable even if the board has not polled them in yet. */
+  onOpenRelatedTask?: (taskId: string) => void;
   /** One-shot request to land on a specific subagent's tab once the panel
    *  knows that subagent (the pipeline run view's "Open transcript" on a
    *  satellite's helper). `nonce` makes each request distinct so the same
@@ -275,6 +282,7 @@ interface Props {
  *  reference across renders (never triggers a memoized child to re-render
  *  just because the caller omitted the prop). */
 function noOpOpenPipeline(): void {}
+function noOpOpenRelatedTask(): void {}
 
 const STATUS_VARIANT: Record<Run["status"], "default" | "secondary" | "outline" | "destructive"> = {
   running: "default",
@@ -355,7 +363,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue, onOpenPipeline = noOpOpenPipeline, focusSubagent = null, onFocusSubagentConsumed }: Props) {
+export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue, onOpenPipeline = noOpOpenPipeline, onOpenRelatedTask = noOpOpenRelatedTask, focusSubagent = null, onFocusSubagentConsumed }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -572,6 +580,7 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles
           onViewPullRequest={onViewPullRequest}
           onViewIssue={onViewIssue}
           onOpenPipeline={onOpenPipeline}
+          onOpenRelatedTask={onOpenRelatedTask}
           focusSubagent={focusSubagent}
           onFocusSubagentConsumed={onFocusSubagentConsumed}
         />
@@ -606,6 +615,7 @@ function RunPanelBody({
   onViewPullRequest,
   onViewIssue,
   onOpenPipeline,
+  onOpenRelatedTask,
   focusSubagent,
   onFocusSubagentConsumed,
 }: {
@@ -642,6 +652,8 @@ function RunPanelBody({
    *  on the outer `RunPanel` component. Always a function by the time it
    *  reaches here (defaulted at the `RunPanel` call site). */
   onOpenPipeline: (parentTaskId: string) => void;
+  /** See {@link Props.onOpenRelatedTask}. */
+  onOpenRelatedTask: (taskId: string) => void;
   /** See `Props.focusSubagent` on the outer `RunPanel`. */
   focusSubagent: { id: string; nonce: number; consumed?: boolean } | null;
   /** See `Props.onFocusSubagentConsumed` on the outer `RunPanel`. */
@@ -787,6 +799,7 @@ function RunPanelBody({
    *  overlap the tail of what a previous page fetch (or the live window)
    *  already loaded. */
   const loadedDbIdsRef = useRef<Set<number>>(new Set());
+  const replayGenerationRef = useRef(0);
   /** DB id of the earliest event currently anchoring the "Load earlier"
    *  cursor, or null when unknown (hides the button — see `StreamEvent.dbId`
    *  and the window-trim comment in the SSE effect below). Seeded from the
@@ -994,6 +1007,8 @@ function RunPanelBody({
   useEffect(() => {
     setEvents([]);
     nextEventIdRef.current = 0;
+    let disposed = false;
+    let receivedReplay = false;
     // Fallback half of the stream-ready gate (see the comment above): if
     // `replay_meta` (below) hasn't arrived within STREAM_READY_FALLBACK_MS,
     // let the deferred fetches go anyway rather than waiting on a stream
@@ -1005,7 +1020,7 @@ function RunPanelBody({
     // follow-up folded into a long in-flight turn — whose live echo and JSONL
     // twin are separated by thousands of intervening events — still collapses
     // to a single bubble. See `event-dedup.ts`.
-    const dedupe = createEventDeduper();
+    let dedupe = createEventDeduper();
     // Coalesce the open-time replay burst into one state update per batch. On
     // connect the server streams the whole history as one SSE frame per event;
     // each `onmessage` is its own event-loop task, so React can't auto-batch
@@ -1213,6 +1228,34 @@ function RunPanelBody({
         buffer.push({ ...e, id: nextEventIdRef.current++, dbId });
       },
       (meta) => {
+        const replaceWindow = browserMode && receivedReplay && replayWindowHasGap(meta.earliestId, loadedDbIdsRef.current);
+        receivedReplay = true;
+        if (replaceWindow) {
+          // A long outage can exceed the server's bounded replay. Keeping
+          // an old cursor would skip the missing middle when paging back.
+          buffer.dispose();
+          dedupe = createEventDeduper();
+          replayGenerationRef.current++;
+          eventsRef.current = [];
+          loadedDbIdsRef.current.clear();
+          setEvents([]);
+          setRebuilt(null);
+          setRebuildNote(null);
+          setLoadingEarlier(false);
+          nearBottomRef.current = true;
+          scrollRestoreRef.current = null;
+          setEarliestId(meta.earliestId);
+          setHasMoreEarlier(meta.hasMore);
+        }
+        if (browserMode) {
+          // Interactions can resolve while disconnected, and these live
+          // events are not in persisted log replay. Reconcile the snapshot.
+          void api.listPendingInteractions(task.id).then((list) => {
+            if (!disposed) setInteractions(list);
+          }).catch(() => {});
+          runsPollKickRef.current();
+          subagentsPollKickRef.current();
+        }
         // First (successful) half of the stream-ready gate: this frame is
         // always the very first thing the server sends on (re)connect (see
         // below), so it's the earliest reliable signal that this task's
@@ -1236,13 +1279,16 @@ function RunPanelBody({
         // cursor reaches furthest back. `hasMore` only ever grows for the
         // same reason: once we know older history exists, a later replay
         // that (re)confirms a narrower window can't un-know that.
-        setEarliestId((prev) =>
-          prev == null ? meta.earliestId : meta.earliestId == null ? prev : Math.min(prev, meta.earliestId),
-        );
-        setHasMoreEarlier((prev) => prev || meta.hasMore);
+        if (!replaceWindow) {
+          setEarliestId((prev) =>
+            prev == null ? meta.earliestId : meta.earliestId == null ? prev : Math.min(prev, meta.earliestId),
+          );
+          setHasMoreEarlier((prev) => prev || meta.hasMore);
+        }
       },
     );
     return () => {
+      disposed = true;
       clearTimeout(readyTimer);
       buffer.dispose();
       if (kickTimer) clearTimeout(kickTimer);
@@ -1486,10 +1532,11 @@ function RunPanelBody({
     // resolving after the user has moved to a different task must not
     // prepend task A's history into task B's transcript state.
     const sentTaskId = task.id;
+    const sentGeneration = replayGenerationRef.current;
     setLoadingEarlier(true);
     void api.fetchTaskEventsPage(sentTaskId, earliestId)
       .then((page) => {
-        if (currentTaskIdRef.current !== sentTaskId) return;
+        if (currentTaskIdRef.current !== sentTaskId || replayGenerationRef.current !== sentGeneration) return;
         // Defensive dedupe: `earliestId` can point past events this panel
         // already holds — e.g. an SSE reconnect moved it backward (see the
         // `replay_meta` handler's "never move forward" comment above), so a
@@ -1522,7 +1569,7 @@ function RunPanelBody({
       })
       .catch(() => { /* transient failure — button stays enabled to retry */ })
       .finally(() => {
-        if (currentTaskIdRef.current === sentTaskId) setLoadingEarlier(false);
+        if (currentTaskIdRef.current === sentTaskId && replayGenerationRef.current === sentGeneration) setLoadingEarlier(false);
       });
   }, [task.id, earliestId, hasMoreEarlier, loadingEarlier]);
 
@@ -3554,7 +3601,7 @@ function RunPanelBody({
           <Tooltip
             align="end"
             label={
-              task.worktreePath
+              browserMode ? "Copy the server directory path" : task.worktreePath
                 ? `Open the worktree in your file manager: ${task.worktreePath}`
                 : `Open the project workdir in your file manager: ${task.workdir}`
             }
@@ -3568,7 +3615,7 @@ function RunPanelBody({
                   taskId: task.id,
                 }).catch(() => { /* swallowed — openPath failures are best-effort */ })
               }
-              aria-label="Open working folder"
+              aria-label={browserMode ? "Copy server directory path" : "Open working folder"}
             >
               <FolderOpen className="size-4" />
             </Button>
@@ -3823,6 +3870,8 @@ function RunPanelBody({
         // proving a run happened is enough.
         hasRun={runs.length > 0 || task.hasOpenableRun || task.runId != null}
       />
+
+      <DoneFollowupsPanel task={task} onOpenRelatedTask={onOpenRelatedTask} />
 
       <RunsList runs={runs} usageByRun={usageByRunId} providerByRun={providerByRunId} titleByRun={titleByRunId} />
 
@@ -6828,6 +6877,20 @@ function TaskDetails({
   };
   const kind = harnessKindOf(task.agent, harnesses);
   const selectedStatus = agents.find((a) => a.harnessId === task.agent);
+  // Only ordinary Claude Code / Codex tasks participate. Pipeline parents
+  // and their internal step tasks are deliberately excluded even when their
+  // first/only harness happens to be Claude Code or Codex.
+  const doneFollowupsEligible = task.pipelineId == null
+    && task.pipelineParentId == null
+    && (kind === "claude-code" || kind === "codex");
+  // A Run snapshots this setting at launch, so it remains useful to change
+  // while a task is running (it affects a subsequent run). Once the task is
+  // Done, creation/result handling is already owned by the server and the
+  // value is informational rather than an editable escape hatch.
+  const doneFollowupsEditable = doneFollowupsEligible
+    && task.archivedAt == null
+    && task.column !== "done";
+  const [savingDoneFollowups, setSavingDoneFollowups] = useState(false);
 
   const save = async (patch: Partial<Task>) => {
     try {
@@ -6837,6 +6900,28 @@ function TaskDetails({
       // and the dropdown reverts on its own. We could surface this through
       // the global error toast, but for now keeping it quiet matches the
       // optimistic-UI pattern the rest of the panel uses.
+    }
+  };
+
+  const saveDoneFollowupsEnabled = async (enabled: boolean) => {
+    if (!doneFollowupsEditable || savingDoneFollowups) return;
+    const previous = task.doneFollowupsEnabled ?? false;
+    setSavingDoneFollowups(true);
+    // Make the setting immediately legible in both this panel and the board;
+    // the authoritative server response below corrects the optimistic value.
+    onTaskFieldsChanged?.(task.id, { doneFollowupsEnabled: enabled });
+    try {
+      const updated = await api.updateTask(task.id, { doneFollowupsEnabled: enabled });
+      onTaskFieldsChanged?.(task.id, {
+        doneFollowupsEnabled: updated.doneFollowupsEnabled ?? enabled,
+      });
+    } catch (e) {
+      onTaskFieldsChanged?.(task.id, { doneFollowupsEnabled: previous });
+      toast.error("Couldn't update follow-up task setting", {
+        description: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setSavingDoneFollowups(false);
     }
   };
 
@@ -6987,7 +7072,20 @@ function TaskDetails({
       : nextEfforts.some((e) => e.id === DEFAULT_EFFORT[nextKind])
         ? DEFAULT_EFFORT[nextKind]
         : nextEfforts[0]!.id;
-    void save({ agent: nextId, mode: nextMode, model: nextModel, effort: nextEffort, fast: false, maxMode: false });
+    // Follow-up collection is unavailable for non-Codex/non-Claude harnesses.
+    // Turn its task-level opt-in off in the same PATCH when the user switches
+    // away, rather than sending an invalid enabled task and silently losing
+    // their harness change to the server-side scope guard.
+    const nextSupportsDoneFollowups = nextKind === "claude-code" || nextKind === "codex";
+    void save({
+      agent: nextId,
+      mode: nextMode,
+      model: nextModel,
+      effort: nextEffort,
+      fast: false,
+      maxMode: false,
+      ...(nextSupportsDoneFollowups ? {} : { doneFollowupsEnabled: false }),
+    });
   };
 
   const modeOptions = supportedModes(kind, task.model);
@@ -7235,6 +7333,30 @@ function TaskDetails({
               </>
             )}
 
+            {doneFollowupsEligible && (
+              <>
+                <dt className="text-muted-foreground">Follow-ups</dt>
+                <dd className="min-w-0">
+                  {doneFollowupsEditable ? (
+                    <label
+                      data-testid="task-done-followups"
+                      className="flex items-center gap-2"
+                    >
+                      <Switch
+                        checked={task.doneFollowupsEnabled ?? false}
+                        onCheckedChange={(enabled) => void saveDoneFollowupsEnabled(enabled)}
+                        disabled={savingDoneFollowups}
+                        aria-label="Create follow-up tasks when Done"
+                      />
+                      <span>Create follow-up tasks when Done</span>
+                    </label>
+                  ) : (
+                    <span>{task.doneFollowupsEnabled ? "on" : "off"}</span>
+                  )}
+                </dd>
+              </>
+            )}
+
             <dt className="text-muted-foreground">Project</dt>
             <dd className="min-w-0 truncate font-mono" title={task.workdir}>
               {abbreviateHome(task.workdir, homeDir)}
@@ -7272,9 +7394,9 @@ function TaskDetails({
                         toast.error(msg);
                       });
                     }}
-                    title={`Attach to the tmux session in a new Terminal window (tmux attach -t ${tmuxSession})`}
+                    title={browserMode ? "Copy the command to attach from a server terminal" : `Attach to the tmux session in a new Terminal window (tmux attach -t ${tmuxSession})`}
                   >
-                    <Terminal className="mr-1 size-3" /> Attach
+                    <Terminal className="mr-1 size-3" /> {browserMode ? "Copy attach command" : "Attach"}
                   </Button>
                 </dd>
               </>
@@ -7331,6 +7453,263 @@ function TaskDetails({
         onOpenSettingsAgents={onOpenSettingsAgents}
       />
     </>
+  );
+}
+
+/**
+ * Server-backed view of the one-shot follow-up collection tied to a task's
+ * latest completed run. This intentionally does not create anything itself:
+ * Review is read-only, and a retry only asks the server to re-materialize its
+ * already-persisted candidates after a prior creation failure.
+ */
+function DoneFollowupsPanel({
+  task,
+  onOpenRelatedTask,
+}: {
+  task: Task;
+  onOpenRelatedTask: (taskId: string) => void;
+}) {
+  const [summary, setSummary] = useState<DoneFollowupSummary | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [retrying, setRetrying] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  // A collection arrives when the run settles (running → review), and a
+  // durable request/result arrives when the human moves it to Done. Depend on
+  // the column rather than the whole task object so App's ordinary board poll
+  // doesn't repeatedly refetch an unchanged summary.
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setLoadError(null);
+    setSummary(null);
+    void api.getDoneFollowups(task.id)
+      .then((next) => {
+        if (!cancelled) setSummary(next);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) {
+          setSummary(null);
+          setLoadError(e instanceof Error ? e.message : String(e));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  // The task-detail switch is optimistic and does not change the column, so
+  // include its persisted value (and the latest run identity) rather than
+  // leaving an old disabled/empty summary cached until a later drag or poll.
+  }, [task.id, task.column, task.doneFollowupsEnabled, task.runId, refreshKey]);
+
+  const collection = summary?.collection ?? null;
+  const request = summary?.request ?? null;
+  // Defensive guards keep this panel readable during a rolling web/server
+  // upgrade, where a newly-loaded client could briefly receive an older API
+  // payload before the server restarts.
+  const candidates = Array.isArray(collection?.candidates) ? collection.candidates : [];
+  const sources = Array.isArray(summary?.sources) ? summary.sources : [];
+  const generated = Array.isArray(summary?.generated) ? summary.generated : [];
+  const relevant = summary != null && (
+    summary.enabled
+    || collection != null
+    || request != null
+    || sources.length > 0
+    || generated.length > 0
+  );
+  const shouldSurfaceLoadError = loadError != null && (task.doneFollowupsEnabled ?? false);
+
+  if (!relevant && !shouldSurfaceLoadError) return null;
+
+  const retry = async () => {
+    if (retrying || request?.status !== "failed" || task.column !== "done") return;
+    setRetrying(true);
+    try {
+      const next = await api.retryDoneFollowups(task.id);
+      setSummary(next);
+      // The route may acknowledge a durable pending request before its worker
+      // has finished; fetch once more to adopt either state without making a
+      // second retry call.
+      setRefreshKey((value) => value + 1);
+    } catch (e) {
+      toast.error("Couldn't retry follow-up task creation", {
+        description: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  return (
+    <section
+      data-testid="done-followups-panel"
+      className="border-b border-border/60 px-3 py-2 text-xs"
+    >
+      <div className="flex items-center gap-1.5 font-medium">
+        <Sparkles className="size-3.5 text-primary" aria-hidden />
+        <span>Follow-up tasks</span>
+      </div>
+
+      {shouldSurfaceLoadError ? (
+        <div role="alert" className="mt-2 rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px]">
+          <div className="font-medium">Couldn’t load follow-up task status.</div>
+          <div className="mt-0.5 break-words text-muted-foreground">{loadError}</div>
+        </div>
+      ) : loading && !summary ? (
+        <p className="mt-1 text-[11px] text-muted-foreground">Loading follow-up task status…</p>
+      ) : collection?.status === "failed" ? (
+        <div
+          role="alert"
+          data-testid="done-followups-collection-failed"
+          className="mt-2 rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px]"
+        >
+          <div className="font-medium">Couldn’t collect follow-up candidates.</div>
+          {collection.error && <div className="mt-0.5 break-words text-muted-foreground">{collection.error}</div>}
+          <div className="mt-1 text-muted-foreground">
+            No task was inferred or created from this failed collection.
+          </div>
+        </div>
+      ) : collection?.status === "collected" && candidates.length === 0 ? (
+        <div data-testid="done-followups-zero" className="mt-2 rounded-md border border-border bg-muted/30 p-2 text-[11px]">
+          <div className="font-medium">No follow-up tasks</div>
+          <div className="mt-0.5 text-muted-foreground">
+            The completed run explicitly returned zero independent follow-ups.
+          </div>
+        </div>
+      ) : collection?.status === "collected" ? (
+        <>
+          {task.column === "review" && !request && (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Review these candidates first. Nothing is created until you mark this task Done.
+            </p>
+          )}
+          <div data-testid="done-followups-candidates" className="mt-2 space-y-1.5">
+            {candidates.map((candidate) => {
+              const generatedTaskId = candidate.generatedTaskId
+                ?? generated.find((link) => link.candidateId === candidate.id)?.generatedTaskId
+                ?? null;
+              return (
+                <details key={candidate.id} className="rounded-md border border-border bg-muted/20 p-2" open={candidates.length === 1}>
+                  <summary className="cursor-pointer font-medium">{candidate.title}</summary>
+                  <div className="mt-1.5 space-y-1 text-[11px]">
+                    <p><span className="text-muted-foreground">Why: </span>{candidate.rationale}</p>
+                    <p><span className="text-muted-foreground">Scope: </span>{candidate.scope}</p>
+                    <div>
+                      <span className="text-muted-foreground">Acceptance: </span>
+                      <ul className="ml-4 list-disc">
+                        {candidate.acceptanceCriteria.map((criterion, index) => (
+                          <li key={`${candidate.id}-${index}`}>{criterion}</li>
+                        ))}
+                      </ul>
+                    </div>
+                    {generatedTaskId && (
+                      <button
+                        type="button"
+                        data-testid={`done-followup-target-${candidate.id}`}
+                        onClick={() => onOpenRelatedTask(generatedTaskId)}
+                        title="Open generated task"
+                        className="text-success hover:underline focus-visible:underline"
+                      >
+                        Created Backlog task: <span className="font-mono">{generatedTaskId}</span>
+                      </button>
+                    )}
+                  </div>
+                </details>
+              );
+            })}
+          </div>
+        </>
+      ) : summary?.enabled ? (
+        <p className="mt-1 text-[11px] text-muted-foreground">
+          Candidates will be collected only after a new successful run.
+        </p>
+      ) : null}
+
+      {collection && (
+        <p className="mt-2 text-[10px] text-muted-foreground">
+          Source task: <span className="font-mono">{task.id}</span> · source run: <span className="font-mono">{collection.runId}</span>
+        </p>
+      )}
+
+      {sources.length > 0 && (
+        <div data-testid="done-followups-sources" className="mt-2 text-[11px]">
+          <div className="text-muted-foreground">Created from</div>
+          <ul className="mt-0.5 space-y-0.5">
+            {sources.map((link) => (
+              <li key={`${link.requestId}-${link.candidateId}`}>
+                <button
+                  type="button"
+                  data-testid={`done-followup-source-${link.sourceTaskId}`}
+                  onClick={() => onOpenRelatedTask(link.sourceTaskId)}
+                  title="Open source task"
+                  className="font-mono text-primary hover:underline focus-visible:underline"
+                >
+                  {link.sourceTaskId}
+                </button>
+                <span className="text-muted-foreground"> · run </span>
+                <span className="font-mono">{link.sourceRunId}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {request?.status === "pending" || request?.status === "processing" ? (
+        <p className="mt-2 text-[11px] text-muted-foreground">Creating follow-up tasks…</p>
+      ) : request?.status === "succeeded" ? (
+        <div data-testid="done-followups-request-succeeded" className="mt-2 rounded-md border border-success/40 bg-success/10 p-2 text-[11px]">
+          Created {generated.length} Backlog task{generated.length === 1 ? "" : "s"} from this source task.
+        </div>
+      ) : request?.status === "suppressed" ? (
+        <div className="mt-2 rounded-md border border-border bg-muted/30 p-2 text-[11px]">
+          <div className="font-medium">Follow-up task creation was suppressed.</div>
+          {request.error && <div className="mt-0.5 break-words text-muted-foreground">{request.error}</div>}
+        </div>
+      ) : request?.status === "failed" ? (
+        <div
+          role="alert"
+          data-testid="done-followups-request-failed"
+          className="mt-2 rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px]"
+        >
+          <div className="font-medium">Couldn’t create follow-up tasks.</div>
+          {request.error && <div className="mt-0.5 break-words text-muted-foreground">{request.error}</div>}
+          {task.column === "done" && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="mt-2 h-7 px-2 text-[11px]"
+              data-testid="retry-done-followups"
+              disabled={retrying}
+              onClick={() => void retry()}
+            >
+              {retrying ? "Retrying…" : "Retry creation"}
+            </Button>
+          )}
+        </div>
+      ) : null}
+
+      {generated.length > 0 && (
+        <div data-testid="done-followups-generated" className="mt-2 text-[11px]">
+          <div className="text-muted-foreground">Generated Backlog tasks</div>
+          <ul className="mt-0.5 space-y-0.5">
+            {generated.map((link) => (
+              <li key={`${link.requestId}-${link.candidateId}`}>
+                <button
+                  type="button"
+                  data-testid={`done-followup-generated-${link.generatedTaskId}`}
+                  onClick={() => onOpenRelatedTask(link.generatedTaskId)}
+                  title="Open generated task"
+                  className="font-mono text-primary hover:underline focus-visible:underline"
+                >
+                  {link.generatedTaskId}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -7837,7 +8216,7 @@ function TmuxPromptCard({
             disabled={opening}
           >
             <Terminal className="mr-1 size-3.5" aria-hidden />
-            {opening ? "Opening…" : "Open in Terminal"}
+            {opening ? "Opening…" : browserMode ? "Copy server attach command" : "Open in Terminal"}
           </Button>
         </div>
         <p className="mt-2 text-[11px] text-muted-foreground">

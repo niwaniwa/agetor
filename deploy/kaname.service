@@ -1,0 +1,27 @@
+[Unit]
+Description=KANAME local agent service
+After=network.target
+
+[Service]
+Type=simple
+# Copy to ~/.config/systemd/user/kaname.service and adjust these two paths.
+WorkingDirectory=%h/project/agetor
+ExecStart=%h/.bun/bin/bun run src/bun/kaname.ts
+Environment=AGETOR_DATA_DIR=%h/.kaname
+Environment=AGETOR_DAEMON_IDLE_MS=0
+Environment=KANAME_WEB_PORT=4318
+# For an HTTPS reverse proxy, set KANAME_PUBLIC_ORIGIN=https://kaname.example.com
+# in the environment file. Preserve that hostname in the proxy's Host header.
+EnvironmentFile=-%h/.config/kaname/kaname.env
+UMask=0077
+Restart=on-failure
+RestartSec=3
+# Detached tmux hosts Codex/Claude independently of the service. Send SIGTERM
+# only to Bun so a service restart can recover the same CLI runs. Stopping
+# this service therefore does NOT cancel tasks; use the UI Stop action first.
+# Keep the same data directory, tmux socket, and API token across restarts.
+KillMode=process
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

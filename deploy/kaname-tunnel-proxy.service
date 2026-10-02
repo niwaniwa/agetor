@@ -1,0 +1,10 @@
+[Unit]
+Description=Forward the Cloudflare Docker bridge to KANAME loopback
+Requires=kaname-tunnel-proxy.socket
+After=kaname-tunnel-proxy.socket
+
+[Service]
+Type=notify
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:4318
+NoNewPrivileges=yes
+UMask=0077

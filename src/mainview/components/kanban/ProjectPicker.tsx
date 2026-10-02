@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { Folder, GitBranch, Plus } from "lucide-react";
 import { api } from "@/lib/api";
+import { browserMode } from "@/lib/transport";
+import { ServerPathDialog } from "@/components/ServerPathDialog";
 import { SearchSelect } from "@/components/ui/search-select";
 import { CloneProjectDialog } from "@/components/kanban/CloneProjectDialog";
 import type { Project } from "../../../shared/types.ts";
@@ -48,6 +50,7 @@ export function ProjectPicker({
   const [projects, setProjects] = useState<Project[]>([]);
   const [picking, setPicking] = useState(false);
   const [cloneOpen, setCloneOpen] = useState(false);
+  const [pathOpen, setPathOpen] = useState(false);
 
   const refresh = async () => {
     try { setProjects(await api.listProjects()); }
@@ -87,6 +90,7 @@ export function ProjectPicker({
   }
 
   const onBrowse = async () => {
+    if (browserMode) { setPathOpen(true); return; }
     if (picking) return;
     setPicking(true);
     try {
@@ -122,7 +126,7 @@ export function ProjectPicker({
               className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-accent/60 disabled:opacity-50"
             >
               <Plus className="size-3.5" aria-hidden />
-              {picking ? "Opening folder dialog…" : "Browse for folder…"}
+              {browserMode ? "Add server directory…" : picking ? "Opening folder dialog…" : "Browse for folder…"}
             </button>
             <button
               type="button"
@@ -144,6 +148,11 @@ export function ProjectPicker({
         onClose={() => setCloneOpen(false)}
         onCloned={() => { void refresh(); }}
       />
+      <ServerPathDialog open={pathOpen} title="Add project" initialPath={value} onClose={() => setPathOpen(false)} onSelect={async (path) => {
+        const project = await api.addProject(path);
+        await refresh();
+        onChange(project.path);
+      }} />
     </>
   );
 }

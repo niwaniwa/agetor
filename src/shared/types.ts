@@ -1532,6 +1532,16 @@ export interface Task {
    */
   maxMode: boolean;
   /**
+   * Per-task opt-in for collecting independent follow-up ideas from a run and
+   * creating ordinary Backlog tasks only when a human subsequently moves this
+   * task to Done. The value is a launch-time input: every Run stores its own
+   * immutable snapshot in {@link Run.doneFollowupsEnabled}, so toggling this
+   * later never retroactively changes an existing run. Optional only for
+   * compatibility with older hand-written fixtures; `db.ts` always returns a
+   * boolean and new persisted tasks default to `false`.
+   */
+  doneFollowupsEnabled?: boolean;
+  /**
    * Path-only references the user attached at task creation (files and
    * folders on the user's machine). Empty list when none. Inlined into the
    * launch prompt as text — agetor never copies or uploads these.
@@ -3427,6 +3437,82 @@ export interface Run {
    * unchanged; DB rows predating migration 023 read back as null.
    */
   origin?: "continuation" | null;
+  /**
+   * Immutable snapshot of the source task's `doneFollowupsEnabled` value when
+   * this run was created.  A historical run without this column is treated as
+   * false, never as an eligible follow-up source.  Optional for existing run
+   * fixtures; rows read through `db.ts` always carry a boolean.
+   */
+  doneFollowupsEnabled?: boolean;
+}
+
+/** A validated, independently actionable follow-up proposed by a completed
+ * normal task run.  It is text-only data; it cannot carry launch settings,
+ * paths, a target project, or an instruction to invoke an API. */
+export interface DoneFollowupCandidate {
+  id: string;
+  runId: string;
+  ordinal: number;
+  title: string;
+  rationale: string;
+  scope: string;
+  acceptanceCriteria: string[];
+  createdAt: number;
+  /** Present when this candidate has been materialized into a Backlog task.
+   * The id remains as an audit record even if that generated task is later
+   * deleted. */
+  generatedTaskId: string | null;
+}
+
+/** Outcome of extracting the exact follow-up protocol from one run. */
+export interface DoneFollowupCollection {
+  runId: string;
+  sourceTaskId: string;
+  /** The run snapshot that authorized collection. Kept for diagnostics. */
+  enabled: boolean;
+  status: "collected" | "failed";
+  /** Parse/collection error for `status:"failed"`; never confused with a
+   * successfully-collected empty candidate array. */
+  error: string | null;
+  candidates: DoneFollowupCandidate[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Durable request created by the human Done operation. */
+export interface DoneFollowupRequest {
+  id: string;
+  sourceTaskId: string;
+  sourceRunId: string;
+  status: "pending" | "processing" | "succeeded" | "failed" | "suppressed";
+  error: string | null;
+  attemptCount: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Bidirectional audit relation between the source task and one generated
+ * ordinary task. */
+export interface DoneFollowupGeneratedLink {
+  candidateId: string;
+  requestId: string;
+  sourceTaskId: string;
+  sourceRunId: string;
+  generatedTaskId: string;
+  createdAt: number;
+}
+
+/** Detail-panel-ready view of a source task's most relevant collection and
+ * every generated-task link. */
+export interface DoneFollowupSummary {
+  taskId: string;
+  enabled: boolean;
+  latestRunId: string | null;
+  collection: DoneFollowupCollection | null;
+  request: DoneFollowupRequest | null;
+  /** Non-empty when this task was itself generated from another source. */
+  sources: DoneFollowupGeneratedLink[];
+  generated: DoneFollowupGeneratedLink[];
 }
 
 /** One changed file in a task's git diff (worktree vs its pinned base). */

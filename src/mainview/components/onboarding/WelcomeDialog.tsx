@@ -1,6 +1,7 @@
 import { Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
+import { browserMode } from "@/lib/transport";
 
 interface Props {
   open: boolean;
@@ -33,16 +34,20 @@ export function WelcomeDialog({ open, onAcknowledge, onSkip }: Props) {
             <Sparkles className="size-4" />
           </div>
           <h2 id="onboarding-welcome-title" className="text-base font-semibold">
-            Welcome to Agetor
+            Welcome to {browserMode ? "KANAME" : "Agetor"}
           </h2>
         </div>
 
         <div id="onboarding-welcome-desc" className="space-y-3 pt-4 text-sm text-muted-foreground">
-          <p>
+          {browserMode ? <p>
+            This foundation PoC uses Agetor's task board to run CLI agents on your server.
+            Add a server directory, choose an agent already logged in on that server, and
+            create a task. Agents continue running when you close this browser.
+          </p> : <p>
             Agetor turns a kanban board into a control plane for AI coding agents. A{" "}
             <span className="text-foreground">task</span> is just a prompt, a project folder,
             and a coding agent — Claude Code, Codex, Cursor, or Gemini.
-          </p>
+          </p>}
           <p>
             Run it and the card moves to <span className="text-foreground">Running</span> while
             the agent's output streams live; it lands in{" "}

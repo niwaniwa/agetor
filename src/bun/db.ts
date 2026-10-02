@@ -87,6 +87,7 @@ type TaskRow = {
   mode: string | null; model: string | null; effort: string | null;
   fast: number;
   max_mode: number;
+  done_followups_enabled: number;
   refs: string;
   backlog: string;
   draft: string | null;
@@ -767,6 +768,10 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   effort: r.effort,
   fast: r.fast === 1,
   maxMode: r.max_mode === 1,
+  // The task-level opt-in is mutable, while every launched Run keeps an
+  // independent snapshot.  Legacy rows are backfilled by migration 061's
+  // DEFAULT 0, so a missing/false-ish value is always safely OFF.
+  doneFollowupsEnabled: r.done_followups_enabled === 1,
   references: parseRefs(r.refs),
   backlog: parseBacklog(r.backlog),
   draft: parseDraft(r.draft),
@@ -881,16 +886,17 @@ export const tasks = {
     db.run(
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
-          branch, branch_source, worktree_path, base_ref, pr_url, issue_url, mode, model, effort, fast, max_mode, refs, backlog, draft, plans, todo_progress,
+          branch, branch_source, worktree_path, base_ref, pr_url, issue_url, mode, model, effort, fast, max_mode, done_followups_enabled, refs, backlog, draft, plans, todo_progress,
           agent_profile_id, agent_profile,
           pipeline_id, pipeline_run, pipeline_parent_id, pipeline_step_id,
           last_assistant_event_id, last_seen_event_id,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
         t.branch, t.branchSource, t.worktreePath, t.baseRef, t.prUrl ?? null, t.issueUrl ?? null, t.mode, t.model, t.effort, t.fast ? 1 : 0, t.maxMode ? 1 : 0,
+        t.doneFollowupsEnabled ? 1 : 0,
         JSON.stringify(t.references ?? []),
         JSON.stringify(t.backlog ?? []),
         t.draft ? JSON.stringify(t.draft) : null,
@@ -911,7 +917,7 @@ export const tasks = {
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, pipelineId: t.pipelineId ?? null, pipelineRun: t.pipelineRun ?? null, pipelineParentId: t.pipelineParentId ?? null, pipelineStepId: t.pipelineStepId ?? null, unread: false, hasAssistantMessages: false, archivedAt: null };
+    return this.get(t.id) ?? { ...t, doneFollowupsEnabled: t.doneFollowupsEnabled ?? false, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, pipelineId: t.pipelineId ?? null, pipelineRun: t.pipelineRun ?? null, pipelineParentId: t.pipelineParentId ?? null, pipelineStepId: t.pipelineStepId ?? null, unread: false, hasAssistantMessages: false, archivedAt: null };
   },
   update(id: string, patch: Partial<Task>): Task | null {
     const current = this.get(id);
@@ -956,13 +962,13 @@ export const tasks = {
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
-         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, issue_url=?, mode=?, model=?, effort=?, fast=?, max_mode=?, refs=?, backlog=?, draft=?, plans=?, todo_progress=?,
+         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, issue_url=?, mode=?, model=?, effort=?, fast=?, max_mode=?, done_followups_enabled=?, refs=?, backlog=?, draft=?, plans=?, todo_progress=?,
          run_id=?, updated_at=?, archived_at=?
        WHERE id=?`,
       [
         next.title, next.prompt, next.column, next.agent, next.workdir, next.isolation,
         next.taskType,
-        next.branch, next.branchSource, next.worktreePath, next.baseRef, next.prUrl ?? null, next.issueUrl ?? null, next.mode, next.model, next.effort, next.fast ? 1 : 0, next.maxMode ? 1 : 0,
+        next.branch, next.branchSource, next.worktreePath, next.baseRef, next.prUrl ?? null, next.issueUrl ?? null, next.mode, next.model, next.effort, next.fast ? 1 : 0, next.maxMode ? 1 : 0, next.doneFollowupsEnabled ? 1 : 0,
         JSON.stringify(next.references ?? []),
         JSON.stringify(next.backlog ?? []),
         next.draft ? JSON.stringify(next.draft) : null,
@@ -2209,6 +2215,7 @@ type RunRow = {
   gemini_session_id: string | null;
   fx_session_id: string | null;
   origin: string | null;
+  done_followups_enabled: number;
 };
 
 /**
@@ -2303,6 +2310,9 @@ const toRun = (r: RunRow): Run => ({
   geminiSessionId: r.gemini_session_id,
   fxSessionId: r.fx_session_id,
   origin: (r.origin as Run["origin"]) ?? null,
+  // A Run's collection flag is an immutable launch-time snapshot. Rows
+  // created before migration 061 read as false through the DEFAULT.
+  doneFollowupsEnabled: r.done_followups_enabled === 1,
 });
 
 export const runs = {
@@ -2332,20 +2342,24 @@ export const runs = {
   /** `r.origin` is optional on the `Run` type (most callers don't set it —
    *  only the continuation-run factory does) so `?? null` keeps a
    *  user-initiated run's row explicitly NULL rather than the JS `undefined`
-   *  bun:sqlite would otherwise bind. */
+   *  bun:sqlite would otherwise bind. `doneFollowupsEnabled` follows the
+   *  same optional-fixture convention but is persisted as a false-by-default,
+   *  immutable launch snapshot. */
   insert(r: Run): Run {
     db.run(
-      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, origin)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.cursorSessionId, r.geminiSessionId, r.fxSessionId ?? null, r.origin ?? null],
+      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, origin, done_followups_enabled)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.cursorSessionId, r.geminiSessionId, r.fxSessionId ?? null, r.origin ?? null, r.doneFollowupsEnabled ? 1 : 0],
     );
-    return { ...r, origin: r.origin ?? null };
+    return { ...r, origin: r.origin ?? null, doneFollowupsEnabled: r.doneFollowupsEnabled ?? false };
   },
   update(id: string, patch: Partial<Run>): Run | null {
     const row = db.query<RunRow, [string]>(`SELECT * FROM runs WHERE id = ?`).get(id);
     if (!row) return null;
     const current = toRun(row);
-    const next: Run = { ...current, ...patch, id };
+    // This flag records the launch policy for an already-created run. Do not
+    // let a generic lifecycle update mutate it retroactively.
+    const next: Run = { ...current, ...patch, id, doneFollowupsEnabled: current.doneFollowupsEnabled ?? false };
     db.run(
       `UPDATE runs SET status=?, ended_at=?, exit_code=?, claude_session_id=?, codex_session_id=?, cursor_session_id=?, gemini_session_id=?, fx_session_id=? WHERE id=?`,
       [next.status, next.endedAt, next.exitCode, next.claudeSessionId, next.codexSessionId, next.cursorSessionId, next.geminiSessionId, next.fxSessionId, id],

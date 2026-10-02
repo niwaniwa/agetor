@@ -1,3 +1,5 @@
+import { browserMode, createTransport, reportUnauthorized, watchConnection } from "./transport";
+import { toast } from "sonner";
 import type {
   AgentKind,
   AgentProfile,
@@ -7,6 +9,7 @@ import type {
   BranchNamingConfig,
   ColumnId,
   DiscoveredAccount,
+  DoneFollowupSummary,
   GlobalEvent,
   GitHubIssueThreadResult,
   GitHubItemKind,
@@ -336,7 +339,13 @@ const params = new URLSearchParams(
 );
 const API_PORT = injected?.port ?? params.get("api") ?? "4317";
 const API_TOKEN = injected?.token ?? params.get("token") ?? "";
-const BASE = `http://127.0.0.1:${API_PORT}`;
+const transport = createTransport({
+  browser: browserMode,
+  origin: _win?.location.origin ?? "http://127.0.0.1",
+  port: API_PORT,
+  token: API_TOKEN,
+});
+const BASE = transport.base;
 
 /** Error thrown for any non-2xx API response. Carries the parsed JSON body
  *  so callers can read structured fields (e.g. the `taskIds` list returned
@@ -369,10 +378,12 @@ async function j<T>(
     ...init,
     headers: {
       "content-type": "application/json",
-      "authorization": `Bearer ${API_TOKEN}`,
+      ...transport.headers,
       ...(init?.headers ?? {}),
     },
-  }, opts);
+  }, browserMode && init?.method && !["GET", "HEAD"].includes(init.method)
+    ? { retry: false } : opts);
+  reportUnauthorized(res);
   if (res.status === 204) return undefined as T;
   const body = await res.json().catch(() => null);
   if (!res.ok) {
@@ -433,6 +444,11 @@ export interface HarnessInput {
   env: Record<string, string>;
 }
 
+async function copyServerPath(path: string): Promise<void> {
+  await navigator.clipboard.writeText(path);
+  toast.success("Server path copied", { description: path });
+}
+
 /** Body shape for `POST /agent-profiles` / `PATCH /agent-profiles/:id` — see
  *  `docs/plans/agent-profiles.md` §3 for the full contract. `harness` is a
  *  harness id (same semantics as `Task.agent` / `createTask`'s `agent`).
@@ -456,14 +472,14 @@ export const api = {
   /** Toggle the window's macOS "zoom" state. Wired up to double-click on
    *  the app bar in App.tsx because Electrobun's drag region doesn't
    *  implement the native title-bar double-click gesture. */
-  toggleWindowZoom: () =>
+  toggleWindowZoom: () => browserMode ? Promise.resolve({ ok: true, skipped: "browser" }) :
     j<{ ok: boolean; skipped?: string }>("/window/toggle-zoom", { method: "POST" }),
   /** Ask the main process to raise + focus the app window. A WKWebView's own
    *  `window.focus()` can't activate the host NSApplication, so every "bring
    *  agetor to front" affordance (toast clicks, etc.) has to round-trip
    *  through here instead. Best-effort UI polish: swallows failures behind a
    *  console.warn rather than throwing into a React event handler. */
-  focusWindow: (): Promise<void> =>
+  focusWindow: (): Promise<void> => browserMode ? Promise.resolve(window.focus()) :
     j<{ ok: true }>("/window/focus", { method: "POST" })
       .then(() => undefined)
       .catch((e) => { console.warn("[agetor] focusWindow failed", e); }),
@@ -504,7 +520,8 @@ export const api = {
   /** Daily per-model token rollup for a claude-code harness's account. */
   getAccountUsage: (id: string) =>
     j<AccountUsagePayload>(`/harnesses/${encodeURIComponent(id)}/account-usage`),
-  openHarnessTerminal: (id: string) =>
+  openHarnessTerminal: (id: string) => browserMode
+    ? Promise.reject(new Error("Run the CLI login command in a terminal on the KANAME server, then refresh this page.")) :
     j<{ ok: true }>(`/harnesses/${encodeURIComponent(id)}/open-terminal`, {
       method: "POST",
     }),
@@ -604,6 +621,8 @@ export const api = {
       { method: "POST" },
     ),
   listProjects: () => j<Project[]>("/projects"),
+  addProject: (path: string) =>
+    j<Project>("/projects", { method: "POST", body: JSON.stringify({ path }) }, { retry: false }),
   pickProject: (startingFolder?: string) =>
     j<{ project: Project | null }>("/projects/pick", {
       method: "POST",
@@ -679,7 +698,7 @@ export const api = {
    *  drag pasteboard — WKWebView exposes no `file://` URLs on a drop, so this
    *  is the fallback for non-image files/folders dragged from Finder. The
    *  server stats each (directory-ness correct, nonexistent dropped). */
-  dragRefs: () =>
+  dragRefs: () => browserMode ? Promise.resolve([] as TaskReference[]) :
     j<{ refs: TaskReference[] }>("/refs/drag", { method: "POST" }).then((r) => r.refs),
   listBranches: (dir: string) =>
     j<BranchInfo[]>(`/projects/branches?path=${encodeURIComponent(dir)}`),
@@ -1372,6 +1391,9 @@ export const api = {
     effort?: string | null;
     fast?: boolean;
     maxMode?: boolean;
+    /** Per-task opt-in for collecting independent candidate tasks from the
+     * next eligible Claude Code/Codex run. Defaults to false server-side. */
+    doneFollowupsEnabled?: boolean;
     /** Initial column. Defaults to "backlog" if omitted. */
     column?: ColumnId;
     references?: TaskReference[];
@@ -1400,6 +1422,16 @@ export const api = {
     j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
   moveTask: (id: string, column: ColumnId) =>
     j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify({ column }) }),
+  /** Persisted candidate/result history for the task's current Done follow-up
+   * source. The server returns an empty summary for tasks that never opted in. */
+  getDoneFollowups: (taskId: string) =>
+    j<DoneFollowupSummary>(`/tasks/${encodeURIComponent(taskId)}/done-followups`),
+  /** Explicitly retry a previously failed materialization using its saved,
+   * validated candidates. It never launches another CLI turn. */
+  retryDoneFollowups: (taskId: string) =>
+    j<DoneFollowupSummary>(`/tasks/${encodeURIComponent(taskId)}/done-followups/retry`, {
+      method: "POST",
+    }, { retry: false }),
   deleteTask: (id: string) => j<void>(`/tasks/${id}`, { method: "DELETE" }),
   // `pending: true` (optional): the server returned before the agent spawn
   // finished; the run row already exists (task-details-blank-while-session-restores.md §3.1).
@@ -1474,7 +1506,7 @@ export const api = {
   /** ws:// URL for a terminal's duplex stream. EventSource-style token in the
    *  query string since WebSockets can't set the Authorization header. */
   terminalSocketUrl: (id: string) =>
-    `ws://127.0.0.1:${API_PORT}/terminals/${encodeURIComponent(id)}/ws?token=${encodeURIComponent(API_TOKEN)}`,
+    transport.socketUrl(`/terminals/${encodeURIComponent(id)}/ws`),
   listRuns: (taskId: string) => j<Run[]>(`/tasks/${taskId}/runs`),
   /** Backward page of a task's persisted events, older than `beforeId`
    *  (exclusive) — drives the run panel's "Load earlier" affordance once the
@@ -1626,7 +1658,8 @@ export const api = {
    * or, when `taskId` is supplied, relative to the task's cwd
    * (worktreePath ?? workdir).
    */
-  openPath: (input: { path: string; taskId?: string }) =>
+  openPath: (input: { path: string; taskId?: string }) => browserMode
+    ? copyServerPath(input.path).then(() => ({ opened: false, path: input.path })) :
     j<{ opened: boolean; path: string }>(`/open-path`, {
       method: "POST",
       body: JSON.stringify(input),
@@ -1638,7 +1671,8 @@ export const api = {
    * `POST /reveal-path` route (landing alongside this in the same branch)
    * answers 501 under the headless backend, same as `/open-path`.
    */
-  revealPath: (input: { path: string; taskId?: string }) =>
+  revealPath: (input: { path: string; taskId?: string }) => browserMode
+    ? copyServerPath(input.path).then(() => ({ revealed: false, path: input.path })) :
     j<{ revealed: boolean; path: string }>(`/reveal-path`, {
       method: "POST",
       body: JSON.stringify(input),
@@ -1649,21 +1683,31 @@ export const api = {
    * sandboxed; `target="_blank"` does nothing, so anchor clicks need to
    * round-trip through the Bun main process to reach `Utils.openExternal`.
    */
-  openExternal: (url: string) =>
-    j<{ opened: boolean; url: string }>(`/open-external`, {
-      method: "POST",
-      body: JSON.stringify({ url }),
-    }),
+  openExternal: (url: string): Promise<{ opened: boolean; url: string }> => {
+    if (browserMode) {
+      if (!/^(https?:|mailto:)/i.test(url)) return Promise.reject(new Error("Unsupported link protocol"));
+      window.open(url, "_blank", "noopener,noreferrer");
+      return Promise.resolve({ opened: true, url });
+    }
+    return j(`/open-external`, { method: "POST", body: JSON.stringify({ url }) });
+  },
 
   /**
    * Open the claude-code task's tmux session in a new Terminal.app window.
    * Returns the session name on success. Server-side checks the session is
    * actually live and that the task uses a claude-code harness.
    */
-  openTmux: (taskId: string) =>
-    j<{ ok: true; sessionName: string }>(`/tasks/${taskId}/open-tmux`, {
+  openTmux: async (taskId: string): Promise<{ ok: true; sessionName: string }> => {
+    if (browserMode) {
+      const { sessionName, command } = await j<{ ok: true; sessionName: string; command: string }>(`/tasks/${taskId}/open-tmux`, { method: "POST" });
+      await navigator.clipboard.writeText(command);
+      toast.success("Attach command copied", { description: "Run it in a terminal on the KANAME server." });
+      return { ok: true, sessionName };
+    }
+    return j<{ ok: true; sessionName: string }>(`/tasks/${taskId}/open-tmux`, {
       method: "POST",
-    }),
+    });
+  },
 
   /** Absolute URL for an inline `<img>` thumbnail of a referenced image path.
    *  `<img>` can't set an Authorization header any more than EventSource can,
@@ -1674,7 +1718,7 @@ export const api = {
    *  file), and 200 with the raw image bytes otherwise; callers handle the
    *  error cases via the `<img>` element's own `onError`. */
   filePreviewUrl: (path: string): string =>
-    `${BASE}/files/preview?path=${encodeURIComponent(path)}&token=${encodeURIComponent(API_TOKEN)}`,
+    transport.url(`/files/preview?path=${encodeURIComponent(path)}`),
 
   /** Absolute URL for a task's worktree-diff binary blob (old or new side of
    *  a binary file), for `<img src>` use in `BinaryFilePreview`. Same
@@ -1684,7 +1728,7 @@ export const api = {
    *  "new"` from the on-disk file in the task's cwd (worktree or workdir),
    *  mirroring what `getTaskDiff`'s underlying `git diff` compared. */
   taskDiffBlobUrl: (taskId: string, path: string, side: "old" | "new"): string =>
-    `${BASE}/tasks/${taskId}/diff/blob?path=${encodeURIComponent(path)}&side=${side}&token=${encodeURIComponent(API_TOKEN)}`,
+    transport.url(`/tasks/${taskId}/diff/blob?path=${encodeURIComponent(path)}&side=${side}`),
 
   /** Absolute URL for a GitHub PR's binary blob (old or new side), for
    *  `<img src>` use in `BinaryFilePreview`. Identifying params mirror
@@ -1700,9 +1744,8 @@ export const api = {
       number: String(opts.number),
       filePath: opts.filePath,
       side: opts.side,
-      token: API_TOKEN,
     });
-    return `${BASE}/github/pull-blob?${q.toString()}`;
+    return transport.url(`/github/pull-blob?${q.toString()}`);
   },
 
   /** Fetch binary blob bytes via an `Authorization: Bearer` header — used
@@ -1718,8 +1761,9 @@ export const api = {
    *  callers can render a matching empty state. */
   fetchBlobBytes: async (url: string): Promise<ArrayBuffer> => {
     const res = await fetch(url, {
-      headers: { "authorization": `Bearer ${API_TOKEN}` },
+      headers: { ...transport.headers },
     });
+    reportUnauthorized(res);
     if (!res.ok) {
       if (res.status === 404) throw new Error("missing");
       if (res.status === 413) throw new Error("too-large");
@@ -1736,7 +1780,8 @@ export const api = {
    *  before rendering. */
   probeBlobStatus: async (url: string): Promise<"missing" | "too-large" | "ok" | "error"> => {
     try {
-      const res = await fetch(url, { headers: { "authorization": `Bearer ${API_TOKEN}` } });
+      const res = await fetch(url, { headers: { ...transport.headers } });
+      reportUnauthorized(res);
       void res.body?.cancel();
       if (res.status === 404) return "missing";
       if (res.status === 413) return "too-large";
@@ -1754,10 +1799,11 @@ export const api = {
       method: "POST",
       headers: {
         "content-type": blob.type || "application/octet-stream",
-        "authorization": `Bearer ${API_TOKEN}`,
+        ...transport.headers,
       },
       body: blob,
     });
+    reportUnauthorized(res);
     const body = await res.json().catch(() => null);
     if (!res.ok) {
       const msg = body && typeof body === "object" && "error" in body && body.error
@@ -1778,10 +1824,11 @@ export const api = {
       method: "POST",
       headers: {
         "content-type": blob.type || "application/octet-stream",
-        "authorization": `Bearer ${API_TOKEN}`,
+        ...transport.headers,
       },
       body: blob,
     });
+    reportUnauthorized(res);
     const body = await res.json().catch(() => null);
     if (!res.ok) {
       const msg = body && typeof body === "object" && "error" in body && body.error
@@ -1866,7 +1913,7 @@ export const api = {
     subtitle?: string;
     silent?: boolean;
     taskId?: string;
-  }) =>
+  }) => browserMode ? Promise.resolve({ ok: true }) :
     j<{ ok: boolean }>("/notifications", {
       method: "POST",
       body: JSON.stringify(input),
@@ -1877,7 +1924,8 @@ export const api = {
    *  App.tsx to surface success / error / pending-input across every task
    *  without subscribing per-task. */
   subscribeGlobalEvents(onEvent: (e: GlobalEvent) => void): () => void {
-    const es = new EventSource(`${BASE}/events?token=${encodeURIComponent(API_TOKEN)}`);
+    const es = new EventSource(transport.url(`/events`));
+    watchConnection(es);
     es.onmessage = (m) => {
       try {
         const parsed = JSON.parse(m.data);
@@ -1903,7 +1951,7 @@ export const api = {
    *  is forwarded to `onEvent` as-is, so a new variant needs no change in
    *  this function. Live-only (no replay). */
   subscribeAppEvents(onEvent: (e: AppEvent) => void): () => void {
-    const es = new EventSource(`${BASE}/app/events?token=${encodeURIComponent(API_TOKEN)}`);
+    const es = new EventSource(transport.url(`/app/events`));
     es.onmessage = (m) => {
       try {
         const parsed = JSON.parse(m.data);
@@ -1922,7 +1970,7 @@ export const api = {
 
   subscribeRun(runId: string, onEvent: (e: RunEvent) => void): () => void {
     // EventSource can't set headers, so the server also accepts the token via query.
-    const es = new EventSource(`${BASE}/runs/${runId}/events?token=${encodeURIComponent(API_TOKEN)}`);
+    const es = new EventSource(transport.url(`/runs/${runId}/events`));
     es.onmessage = (m) => {
       try {
         const parsed = JSON.parse(m.data);
@@ -1949,7 +1997,7 @@ export const api = {
     onEvent: (e: RunEvent) => void,
     onReplayMeta?: (meta: TaskEventsReplayMeta) => void,
   ): () => void {
-    const es = new EventSource(`${BASE}/tasks/${taskId}/events?token=${encodeURIComponent(API_TOKEN)}`);
+    const es = new EventSource(transport.url(`/tasks/${taskId}/events`));
     if (onReplayMeta) {
       es.addEventListener(TASK_EVENTS_REPLAY_META_EVENT, (m: MessageEvent) => {
         try {

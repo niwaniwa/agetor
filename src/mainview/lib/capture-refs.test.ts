@@ -122,6 +122,22 @@ test("returns empty when source is null", async () => {
   expect(r).toEqual({ items: [], skipped: 0, skippedFolders: 0 });
 });
 
+test("browser drops upload bytes instead of resolving a client path on the server", async () => {
+  const file = Object.assign(new File(["client contents"], "notes.txt", { type: "text/plain" }), { path: "/home/client/notes.txt" });
+  const dt = makeUriListTransfer({ "text/uri-list": "file:///home/client/notes.txt" }, [{ kind: "file", file }]);
+  const result = await captureDroppedOrPastedItems(dt, {
+    remoteHost: true,
+    resolver: async () => { throw new Error("Must not resolve client paths"); },
+    dragRefs: async () => { throw new Error("Must not inspect server pasteboard"); },
+    attachmentUploader: async (blob, name) => {
+      expect(await blob.text()).toBe("client contents");
+      return { path: "/server/attachments/notes.txt", basename: name };
+    },
+  });
+  expect(result.items[0]?.ref.path).toBe("/server/attachments/notes.txt");
+  expect(result.error).toBeUndefined();
+});
+
 test("pathful file lands as a ref without invoking the uploader", async () => {
   let uploads = 0;
   const uploader: ScreenshotUploader = async () => {

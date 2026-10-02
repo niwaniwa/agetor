@@ -19,6 +19,7 @@ import { spawnFxViaAcp, type FxMode } from "./fx-acp.ts";
 import { spawnGeminiViaTmux } from "./gemini-tmux.ts";
 import { answerFxPermission, registerFxPermission } from "./interactions.ts";
 import { gitWritableRoots } from "./worktree.ts";
+import { DONE_FOLLOWUPS_PROMPT_MARKER } from "./done-followups.ts";
 
 export type { SpawnedAgent };
 
@@ -867,6 +868,30 @@ export function __getFakeDriver(taskId: string): FakeDriverInstance | undefined 
 export const FAKE_CLAUDE_TODOS_PROMPT_MARKER = "__agetor_fake_claude_todos__";
 
 /**
+ * Prompt-marker trigger for the Done follow-ups fake-driver scenario. This
+ * lets an e2e task select a candidate variant without changing the
+ * worker-scoped fake-driver environment. It is deliberately only honored
+ * when the server-owned Done-follow-ups prompt marker is also present. Thus
+ * the browser test verifies that opt-in actually injected the production
+ * protocol instruction rather than merely placing a fake trigger in user
+ * text. A bare marker (or `:valid`) emits the production wire format;
+ * `:zero` emits a valid empty collection; `:invalid` emits malformed JSON;
+ * `:too-many` emits six otherwise-valid candidates (the product limit is
+ * five); and `:missing` emits no tag.
+ */
+export const FAKE_CLAUDE_DONE_FOLLOWUPS_PROMPT_MARKER = "__agetor_fake_done_followups__";
+
+/** The last marker in a composed prompt wins, matching the other fake
+ * prompt-marker scenarios: step-specific text can override a broad goal. */
+function lastFakeDoneFollowupsVariant(prompt: string): string | null {
+  const index = prompt.lastIndexOf(FAKE_CLAUDE_DONE_FOLLOWUPS_PROMPT_MARKER);
+  if (index < 0) return null;
+  const suffix = prompt.slice(index + FAKE_CLAUDE_DONE_FOLLOWUPS_PROMPT_MARKER.length)
+    .match(/^:([\w-]+)/)?.[1];
+  return suffix ?? "valid";
+}
+
+/**
  * Prompt-marker trigger for the pipeline-handoff fake-driver scenario (see
  * `makeFakeAgent` below and `docs/plans/pipelines.md` §3/T3) — same
  * rationale as {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER}: `pipeline-runner.ts`
@@ -1511,6 +1536,41 @@ function makeFakeAgent(
       }
     });
     after(resolveDelayMs, () => { onChunk("status", "turn complete"); resolveDone(0); });
+  } else if (
+    prompt.includes(FAKE_CLAUDE_DONE_FOLLOWUPS_PROMPT_MARKER)
+    && prompt.includes(DONE_FOLLOWUPS_PROMPT_MARKER)
+  ) {
+    // Test hook for Done follow-up collection. Keep the envelope exactly
+    // aligned with the production contract: the orchestrator persists and
+    // validates this assistant text after a successful run, so a fake run
+    // must exercise the same parser rather than write candidates directly.
+    // This sits ahead of the unrelated canned marker scenarios so a focused
+    // follow-up test cannot be hijacked by a broad worker-scoped fake toggle.
+    const variant = lastFakeDoneFollowupsVariant(prompt) ?? "valid";
+    const candidate = (number: number) => ({
+      title: `Fake follow-up ${number}`,
+      rationale: `The completed fake task exposed follow-up ${number}.`,
+      scope: `Implement and verify the isolated follow-up ${number}.`,
+      acceptanceCriteria: [`Follow-up ${number} has a focused regression check.`],
+    });
+    after(5, () => {
+      if (variant === "missing") {
+        onChunk("assistant", "Completed the fake task, with no follow-up envelope.");
+        return;
+      }
+      if (variant === "invalid") {
+        onChunk("assistant", "Completed.\n<kaname-followups>{\"candidates\":[}</kaname-followups>");
+        return;
+      }
+      const candidates = variant === "zero"
+        ? []
+        : Array.from({ length: variant === "too-many" ? 6 : 2 }, (_, index) => candidate(index + 1));
+      onChunk(
+        "assistant",
+        `Completed.\n<kaname-followups>${JSON.stringify({ candidates })}</kaname-followups>`,
+      );
+    });
+    after(20, () => { onChunk("status", "turn complete"); resolveDone(0); });
   } else if (
     process.env.AGETOR_FAKE_CLAUDE_TODOS === "1"
     || prompt.includes(FAKE_CLAUDE_TODOS_PROMPT_MARKER)
@@ -2388,7 +2448,9 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
     // Hand the orchestrator a thread id so it persists `codex_session_id` and
     // can route follow-ups through `codex exec resume` — mirrors what a real
     // `thread.started` event would deliver.
-    onSessionId?.(`fake-codex-thread-${taskId}`);    return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? defaultModeFor(harness.kind), cwd });  }
+    onSessionId?.(`fake-codex-thread-${taskId}`);
+    return makeFakeAgent(taskId, prompt, onChunk, { runId, kind: harness.kind, mode: opts.mode ?? defaultModeFor(harness.kind), cwd });
+  }
   // Resolve git dirs outside the cwd (the source repo's `.git` for a linked
   // worktree) so a codex `auto` run that has to write there escalates its
   // sandbox to full access. Computed here — the single choke point every codex

@@ -79,6 +79,10 @@ interface Props {
       maxMode: boolean;
       references: TaskReference[];
       taskType: TaskType;
+      /** Ask an eligible Claude Code/Codex run to collect independent
+       *  follow-up candidates when it finishes. Defaults to false; the
+       *  server also validates this separately from the form. */
+      doneFollowupsEnabled?: boolean;
       /** Id of the {@link AgentProfile} this task launches from, or null —
        *  see `AgentProfilePicker` above the harness grid. The server
        *  resolves it and overrides `agent`/`model`/`effort`/`mode`/`fast`/
@@ -204,6 +208,10 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   // every other field below. Mutually exclusive with `agentProfileId` —
   // each picker's `onChange` below clears the other.
   const [pipelineId, setPipelineId] = useState<string | null>(null);
+  // This is deliberately task-scoped rather than a sticky preference: each
+  // new task starts OFF, as does every generated follow-up task. It is reset
+  // whenever the selected launch shape is ineligible below.
+  const [doneFollowupsEnabled, setDoneFollowupsEnabled] = useState(false);
   // Soft-deleted harnesses are excluded from the picker and the default-
   // fallback logic. The full `harnesses` list is still used for
   // `selectedHarness` lookup so the resolved kind stays correct even for a
@@ -550,6 +558,16 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
     ? agents.find((a) => a.harnessId === selectedProfile.harness)
     : selectedStatus;
 
+  // Pipelines and all harness kinds other than Claude Code / Codex are out
+  // of scope for the initial follow-up collection flow. Key this off the id
+  // rather than `selectedPipeline`: immediately after choosing a pipeline,
+  // its object can still be resolving from a fresh list fetch.
+  const doneFollowupsEligible = pipelineId == null
+    && (effectiveKind === "claude-code" || effectiveKind === "codex");
+  useEffect(() => {
+    if (!doneFollowupsEligible) setDoneFollowupsEnabled(false);
+  }, [doneFollowupsEligible]);
+
   // Gemini's one-shot tmux launch has no deferred-paste fallback for an
   // oversized prompt — surfaced here (and blocking submit) rather than
   // letting it fail at spawn time. Mirrors CreateTaskFromIssueDialog's guard.
@@ -605,6 +623,10 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
         maxMode: selectedProfile ? selectedProfile.maxMode : (kind === "cursor" ? maxMode : false),
         references,
         taskType,
+        // Explicit false makes the initial opt-out unambiguous for normal
+        // tasks; omit the key entirely for an ineligible launch shape so a
+        // pipeline / other harness never gets an accidental setting.
+        ...(doneFollowupsEligible ? { doneFollowupsEnabled } : {}),
         // Omit entirely when no profile/pipeline is selected — an explicit
         // `null` still round-trips through the server's own accept-null
         // handling, but a body that never mentions the key at all is the
@@ -639,6 +661,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
     wt.resetAfterSubmit();
     setAgentProfileId(null);
     setPipelineId(null);
+    setDoneFollowupsEnabled(false);
     // Keep `workdir`, `model`, `effort`, `mode` set on purpose — the next
     // task should default to the same project + picks the user just used.
   };
@@ -1116,6 +1139,25 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
               </>
               )}
               </>
+              )}
+
+              {doneFollowupsEligible && (
+                <label
+                  data-testid="new-task-done-followups"
+                  className="flex items-center justify-between gap-3 rounded-md border border-border px-2 py-2 text-xs"
+                >
+                  <span className="min-w-0">
+                    <span className="block font-medium">Create follow-up tasks when Done</span>
+                    <span className="mt-0.5 block text-[11px] text-muted-foreground">
+                      Collects suggestions after a successful run; they stay for review until you mark this task Done.
+                    </span>
+                  </span>
+                  <Switch
+                    checked={doneFollowupsEnabled}
+                    onCheckedChange={setDoneFollowupsEnabled}
+                    aria-label="Create follow-up tasks when Done"
+                  />
+                </label>
               )}
             </div>
 

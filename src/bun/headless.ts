@@ -1,8 +1,9 @@
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN } from "./api-config.ts";
-import { db, dataDir, subagents } from "./db.ts";
-import { reconcileOrphans, rearmFxAutoResumes, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
+import { db, dataDir, harnesses, subagents } from "./db.ts";
+import { hasPendingDoneFollowupWork, reconcileOrphans, rearmFxAutoResumes, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
+import { recoverDoneFollowupRequests } from "./done-followups.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
@@ -119,7 +120,12 @@ function shutdown(reason: string, code = 0): void {
   process.exit(code);
 }
 
-export async function runDaemon(): Promise<void> {
+export interface DaemonOptions {
+  /** A user-managed service stays available even with no browser attached. */
+  persistent?: boolean;
+}
+
+export async function runDaemon(options: DaemonOptions = {}): Promise<ReturnType<typeof startApiServer>> {
   process.env.AGETOR_HEADLESS = "1";
   daemonLog(`cli-daemon starting — pid ${process.pid}, version ${pkg.version}`);
 
@@ -152,6 +158,17 @@ export async function runDaemon(): Promise<void> {
   if (reconciledPipelineRunCount > 0) {
     daemonLog(`reconciled ${reconciledPipelineRunCount} pipeline run(s)`);
   }
+  // A process can stop between recording a successful run and either
+  // collecting its durable candidate envelope or materializing a previously
+  // queued request. Recover from SQLite only; this never starts a CLI and
+  // still rechecks the source's current Done/live-work state before inserts.
+  const recoveredDoneFollowups = recoverDoneFollowupRequests({
+    resolveAgentKind: (task) => harnesses.getByIdOrKind(task.agent)?.kind ?? null,
+    hasPendingWork: (task) => hasPendingDoneFollowupWork(task.id),
+  });
+  if (recoveredDoneFollowups.length > 0) {
+    daemonLog(`recovered ${recoveredDoneFollowups.length} Done follow-up request(s)`);
+  }
   // Re-arm in-memory auto-resume timers for every fx task still carrying a
   // pending schedule — same rationale as index.ts's desktop boot path (see
   // its comment): an in-memory `setTimeout` handle never survives a process
@@ -167,8 +184,11 @@ export async function runDaemon(): Promise<void> {
   // timer is `.unref()`'d internally, satisfying this file's rule that a
   // background timer must never be what keeps the daemon alive past its own
   // idle-shutdown path.
-  void refreshAllModels();
-  startPeriodicDiscovery();
+  const backgroundDiscovery = process.env.AGETOR_BACKGROUND_DISCOVERY !== "0";
+  if (backgroundDiscovery) {
+    void refreshAllModels();
+    startPeriodicDiscovery();
+  }
 
   // Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4):
   // mirrors index.ts's wiring so the headless daemon doesn't accumulate the
@@ -195,23 +215,28 @@ export async function runDaemon(): Promise<void> {
   // index.ts's wiring so the headless daemon also keeps quota snapshots fresh.
   // Both timers are `.unref()`'d — usage polling stops the moment the daemon
   // idle-shuts, by design, since there's no attached UI left to update.
-  const usagePostBootTimer = setTimeout(() => {
-    pollAllUsage().catch((err) => {
-      daemonLog(`usage poll (post-boot) failed: ${(err as Error)?.message ?? String(err)}`);
-    });
-  }, 20_000);
-  usagePostBootTimer.unref();
-  const usageIntervalTimer = setInterval(() => {
-    pollAllUsage().catch((err) => {
-      daemonLog(`usage poll sweep failed: ${(err as Error)?.message ?? String(err)}`);
-    });
-  }, USAGE_POLL_SWEEP_MS);
-  usageIntervalTimer.unref();
+  if (backgroundDiscovery) {
+    const usagePostBootTimer = setTimeout(() => {
+      pollAllUsage().catch((err) => {
+        daemonLog(`usage poll (post-boot) failed: ${(err as Error)?.message ?? String(err)}`);
+      });
+    }, 20_000);
+    usagePostBootTimer.unref();
+    const usageIntervalTimer = setInterval(() => {
+      pollAllUsage().catch((err) => {
+        daemonLog(`usage poll sweep failed: ${(err as Error)?.message ?? String(err)}`);
+      });
+    }, USAGE_POLL_SWEEP_MS);
+    usageIntervalTimer.unref();
+  }
 
   let server: ReturnType<typeof startApiServer>;
   try {
     server = startApiServer(); // no native deps → native routes return 501
   } catch (e) {
+    // The KANAME gateway must have its own initialized core; silently exiting
+    // on a conflicting core would make systemd report success with no web UI.
+    if (options.persistent) throw e;
     // Port busy. If a live core already owns it (the app launched, or another
     // daemon won a startup race), exit quietly — the CLI re-discovers the
     // winner via the creds file. Otherwise it's a real conflict.
@@ -245,7 +270,7 @@ export async function runDaemon(): Promise<void> {
   // Idle-shutdown loop: exit once nothing is running AND no client is attached
   // for longer than the timeout. The interval is unref'd so it never keeps the
   // process alive on its own — the listening server does that.
-  if (IDLE_TIMEOUT_MS > 0) {
+  if (!options.persistent && IDLE_TIMEOUT_MS > 0) {
     let idleSince: number | null = null;
     const timer = setInterval(() => {
       if (hasRunningWork() || attachedClientCount() > 0) {
@@ -257,6 +282,7 @@ export async function runDaemon(): Promise<void> {
     }, IDLE_CHECK_MS);
     timer.unref();
   }
+  return server;
 }
 
 // `bun src/bun/headless.ts` runs the daemon directly (dev); importing this

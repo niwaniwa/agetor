@@ -4,8 +4,9 @@ import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } fr
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
-import { reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
+import { hasPendingDoneFollowupWork, reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
+import { recoverDoneFollowupRequests } from "./done-followups.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
@@ -157,6 +158,17 @@ await reconcileOrphans();
 const reconciledPipelineRunCount = await reconcilePipelineRuns();
 if (reconciledPipelineRunCount > 0) {
   console.log(`[agetor] reconciled ${reconciledPipelineRunCount} pipeline run(s)`);
+}
+
+// Rebuild any interrupted candidate collection and replay durable pending
+// materialization requests before the API becomes visible. The recovery path
+// uses only saved DB data and does not launch a CLI.
+const recoveredDoneFollowups = recoverDoneFollowupRequests({
+  resolveAgentKind: (task) => harnesses.getByIdOrKind(task.agent)?.kind ?? null,
+  hasPendingWork: (task) => hasPendingDoneFollowupWork(task.id),
+});
+if (recoveredDoneFollowups.length > 0) {
+  console.log(`[agetor] recovered ${recoveredDoneFollowups.length} Done follow-up request(s)`);
 }
 
 // Re-arm in-memory auto-resume timers for every fx task still carrying a

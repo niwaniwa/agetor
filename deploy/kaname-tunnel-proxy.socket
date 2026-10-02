@@ -1,0 +1,12 @@
+[Unit]
+Description=KANAME entry from the local Cloudflare Docker network
+
+[Socket]
+# Set this to the gateway of the Docker network containing cloudflared.
+# Do not replace it with 0.0.0.0:4318; keep the LAN interface closed.
+ListenStream=172.20.0.1:4318
+FreeBind=yes
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

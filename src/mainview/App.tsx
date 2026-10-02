@@ -27,6 +27,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
+import { browserMode, RECONNECTED_EVENT } from "@/lib/transport";
 import { Button } from "@/components/ui/button";
 import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
@@ -201,7 +202,7 @@ type AppView =
  * live *inside* `<ThemeProvider>` and call `useTheme()` — the provider must
  * wrap this component, not be called from within it.
  */
-function AppInner() {
+function AppInner({ onLogout, logoutPending }: { onLogout?: () => void; logoutPending?: boolean }) {
   const { preference: themePreference, setPreference: setThemePreference } = useTheme();
   const { setPercent: setFontSizePercent, percentRef: fontSizePercentRef, hasUserAdjustedRef: fontSizeUserAdjustedRef } = useFontSize();
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -602,13 +603,15 @@ function AppInner() {
     // button stays disabled until dataDir is set. Retry every 2s until it
     // lands; the effect's cleanup clears the timer when App unmounts.
     let defaultsTimer: ReturnType<typeof setTimeout> | null = null;
+    let disposed = false;
     const fetchDefaults = () => {
       void api.defaults().then((d) => {
+        if (disposed) return;
         setHomeDir(d.home);
         setDataDir(d.dataDir);
         defaultsTimer = null;
       }).catch(() => {
-        defaultsTimer = setTimeout(fetchDefaults, 2_000);
+        if (!disposed) defaultsTimer = setTimeout(fetchDefaults, 2_000);
       });
     };
     fetchDefaults();
@@ -675,11 +678,16 @@ function AppInner() {
     };
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("focus", onVisible);
+    window.addEventListener("online", onVisible);
+    window.addEventListener(RECONNECTED_EVENT, onVisible);
     return () => {
+      disposed = true;
       clearInterval(t);
       clearInterval(a);
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", onVisible);
+      window.removeEventListener("online", onVisible);
+      window.removeEventListener(RECONNECTED_EVENT, onVisible);
       if (defaultsTimer) clearTimeout(defaultsTimer);
     };
   }, [refresh, refreshAgents, refreshAgentModels, refreshHarnessModels, refreshProjects]);
@@ -884,6 +892,29 @@ function AppInner() {
   const boardSearchRef = useRef<HTMLInputElement>(null);
   useEffect(() => { tasksRef.current = tasks; }, [tasks]);
   useEffect(() => { selectedIdRef.current = selected?.id ?? null; }, [selected]);
+
+  // Done-followup relations persist task ids rather than an in-memory card
+  // reference. Reuse the notification deep-link pattern: take the current
+  // board snapshot when it has the target, otherwise refresh the list before
+  // opening so a just-materialized Backlog task is navigable immediately.
+  const openRelatedTask = useCallback((taskId: string) => {
+    const fresh = findTaskById(tasksRef.current, taskId);
+    if (fresh) {
+      openTask(fresh);
+      return;
+    }
+    void (async () => {
+      try {
+        const list = await api.listTasks();
+        setTasks(list);
+        const found = findTaskById(list, taskId);
+        if (found) openTask(found);
+      } catch {
+        // A deleted related task or a transient refresh failure leaves the
+        // current panel intact; its durable relation stays visible as text.
+      }
+    })();
+  }, [openTask]);
 
   // Cmd/Ctrl+F while no task details panel is open focuses the board's
   // free-text search box and selects its contents so typing replaces the
@@ -1890,7 +1921,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
       }
       items.push({
         id: entry.action,
-        label: entry.label,
+        label: browserMode && entry.action === "open-in-finder" ? "Copy server directory path" : entry.label,
         danger: entry.danger,
         icon: ICON_BY_ACTION[entry.action],
         onSelect: () => runTaskMenuAction(entry.action, taskMenu.task),
@@ -1928,7 +1959,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           badges) to match AppKit's title-bar behavior — clicking a control
           there shouldn't zoom. */}
       <header
-        className="electrobun-webkit-app-region-drag flex h-10 shrink-0 items-center justify-between border-b border-border/60 pl-20 pr-4"
+        className={cn("electrobun-webkit-app-region-drag flex h-10 shrink-0 items-center justify-between border-b border-border/60 pr-4", browserMode ? "pl-4" : "pl-20")}
         onDoubleClick={(e) => {
           if ((e.target as Element).closest(".electrobun-webkit-app-region-no-drag")) return;
           void api.toggleWindowZoom().catch(() => {});
@@ -1937,7 +1968,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2">
             <img src={iconUrl} alt="" className="block size-7 shrink-0 -translate-y-0.5 object-contain" />
-            <h1 className="font-geist text-base font-semibold leading-none tracking-tight">Agetor</h1>
+            <h1 className="font-geist text-base font-semibold leading-none tracking-tight">{browserMode ? "KANAME" : "Agetor"}</h1>
           </div>
           <div className="electrobun-webkit-app-region-no-drag flex items-center gap-2 text-xs text-muted-foreground">
             {visibleTopbarAgents(agents, harnesses).map((a) => {
@@ -1991,6 +2022,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           </div>
         </div>
         <div className="electrobun-webkit-app-region-no-drag flex items-center gap-2">
+          {onLogout && <Button variant="ghost" size="sm" disabled={logoutPending} onClick={onLogout}>Sign out</Button>}
           <span className="text-xs text-muted-foreground">
             {/* m4: counted over `nonStepTasks`, not raw `tasks` — a hidden
                 pipeline step must not inflate the total. */}
@@ -2305,6 +2337,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         onViewPullRequest={viewPullRequest}
         onViewIssue={viewIssue}
         onOpenPipeline={(parentTaskId) => openPipelineRun(parentTaskId)}
+        onOpenRelatedTask={openRelatedTask}
         focusSubagent={focusSubagent}
         onFocusSubagentConsumed={onFocusSubagentConsumed}
       />
@@ -2419,11 +2452,11 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
 /** Root export — mounts `ThemeProvider` and `FontSizeProvider` above
  *  everything so `AppInner` (and, transitively, `SettingsDialog`'s Theme
  *  picker) can call `useTheme()` / `useFontSize()`. */
-export default function App() {
+export default function App(props: { onLogout?: () => void; logoutPending?: boolean } = {}) {
   return (
     <ThemeProvider>
       <FontSizeProvider>
-        <AppInner />
+        <AppInner {...props} />
       </FontSizeProvider>
     </ThemeProvider>
   );

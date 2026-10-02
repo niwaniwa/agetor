@@ -58,9 +58,21 @@ import {
 function resolveHarness(harnessId: string): Harness | null {
   return harnesses.getByIdOrKind(harnessId);
 }
+
+/** Resolve the task switch at the exact moment a new ordinary run is minted.
+ * The resulting value is stored on that run and never read from the task
+ * again for collection, so a later UI toggle cannot rewrite history. */
+function doneFollowupsEnabledForRun(task: Task, harness: Harness | null): boolean {
+  return isDoneFollowupsEligible(task, harness?.kind ?? null).ok;
+}
+
+function promptForDoneFollowups(prompt: string, enabled: boolean): string {
+  return enabled ? appendDoneFollowupsPrompt(prompt) : prompt;
+}
 import {
   cancelPendingForTask,
   countPendingForTask,
+  listPendingForTask,
   setBroadcaster,
   setResolvedBroadcaster,
   type AnyRequest,
@@ -171,6 +183,11 @@ import { appendReferences } from "../shared/refs.ts";
 import { promptByteOverage } from "../shared/prompt-limits.ts";
 import { expandAtReferencesDetailed } from "./project-files.ts";
 import { composeLaunchPrompt, snapshotFromProfile } from "../shared/agent-profile.ts";
+import {
+  appendDoneFollowupsPrompt,
+  collectDoneFollowupsForRun,
+  isDoneFollowupsEligible,
+} from "./done-followups.ts";
 
 type Listener = (e: RunEvent) => void;
 const listeners = new Set<Listener>();
@@ -695,11 +712,13 @@ setResolvedBroadcaster((res: InteractionResolved) => {
  * agetor process. For claude-code runs whose tmux session is still alive
  * (the REPL is detached — it survives our exit), we *reattach* and resume
  * tailing claude's JSONL; the run stays in `running` and the user picks up
- * where they left off. Anything else (tmux gone, JSONL missing, codex run
- * whose child process died with us) is flipped to `orphaned`.
+ * where they left off. Codex also replays its run-owned log to recover a
+ * terminal result written while the service was stopped, even after the
+ * one-shot tmux session exited. Unrecoverable runs become `orphaned`.
  *
  * We never enumerate-and-kill `agetor-*` sessions here. Agetor runs on the
- * user's *shared* default tmux socket, so a blind sweep would reap sessions
+ * instance's dedicated tmux socket, which can still be explicitly shared
+ * through an environment override. A blind sweep could reap sessions
  * belonging to a different agetor instance (dev vs release DB) or to a
  * `bun test` run — the bug this deliberately avoids. Every kill agetor issues
  * is keyed to a specific task id from *this* instance's own DB (see the
@@ -708,7 +727,7 @@ setResolvedBroadcaster((res: InteractionResolved) => {
  * A genuinely-leaked session (crash artifact, or a task deleted while agetor
  * was offline) is simply left alive rather than risk killing a live one.
  *
- * Called once at boot from `src/bun/index.ts`.
+ * Called once at boot from the desktop and headless entrypoints.
  */
 export async function reconcileOrphans(): Promise<number> {
   // Sort newest-first so the at-most-one-reattach-per-task rule below keeps
@@ -732,13 +751,12 @@ export async function reconcileOrphans(): Promise<number> {
     // claude-code, codex, cursor, and gemini runs can all be reattached when
     // their detached tmux session is still alive. The reattach key differs
     // by kind: claude needs its JSONL session uuid (`claude_session_id`),
-    // codex needs its thread id (`codex_session_id`), cursor needs its
+    // codex needs only its run-owned log (thread id can be replayed), cursor needs its
     // `session_id` (`cursor_session_id`), gemini needs its self-issued uuid
     // (`gemini_session_id`) — the per-run log path is derived from the run
-    // id in every case. Note codex's, cursor's, gemini's, and fx's sessions
-    // only live WHILE their turn is in flight (one process per turn), so a
-    // reattachable one of those is by definition one that was still running
-    // when agetor restarted. Also: if we already reattached a newer sibling
+    // id in every case. Codex, cursor, and gemini have one tmux process per
+    // turn; Codex's log can additionally recover offline completion. If we
+    // already recovered a newer sibling
     // for this task, orphan the older one — only one SessionState can drive
     // a given tmux session at a time.
     const reattachKey =
@@ -762,10 +780,13 @@ export async function reconcileOrphans(): Promise<number> {
       (kind === "claude-code" || kind === "codex" || kind === "cursor" || kind === "gemini")
       && task !== null
       && row.tmux_session !== null
-      && reattachKey !== null
+      && (kind === "codex" || reattachKey !== null)
       && !reattachedTaskIds.has(row.task_id)
     ) {
-      canTryReattach = await sessionExistsByName(row.tmux_session);
+      // Codex's run-owned log can recover a terminal turn even when its
+      // one-shot tmux session ended while the service was offline. Its thread
+      // id may also not have been persisted yet when the service stopped.
+      canTryReattach = kind === "codex" || await sessionExistsByName(row.tmux_session);
     }
 
     if (canTryReattach && task) {
@@ -788,7 +809,12 @@ export async function reconcileOrphans(): Promise<number> {
             runId: row.id,
             sessionName: row.tmux_session as string,
             onChunk,
-            seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+            // Codex item ids restart at item_0 on each turn, unlike Claude's
+            // session-wide UUIDs. Dedup only against this run's own events.
+            seenLineUuids: new Set(db.query<{ line_uuid: string }, [string]>(
+              "SELECT line_uuid FROM run_events WHERE run_id = ? AND line_uuid IS NOT NULL AND subagent_id IS NULL",
+            ).all(row.id).map((event) => event.line_uuid)),
+            onSessionId: (id) => runs.update(row.id, { codexSessionId: id }),
           })
         : kind === "cursor"
         ? await reattachCursorSession({
@@ -832,12 +858,12 @@ export async function reconcileOrphans(): Promise<number> {
         reattachedTaskIds.add(row.task_id);
         // Visible seam in the run panel so the user can tell where the
         // process boundary is. Non-JSONL chunk → no dedup key needed.
-        onChunk("status", "reconnected to live session after agetor restart");
+        onChunk("status", "recovered execution state after agetor restart");
         continue;
       }
       // JSONL missing despite live tmux — can't safely resume; kill the
       // session and fall through to orphan marking.
-      await killSessionByName(row.tmux_session as string);
+      if (kind !== "codex") await killSessionByName(row.tmux_session as string);
     }
     orphaned.push({ id: row.id, task_id: row.task_id, prevColumn });
   }
@@ -855,8 +881,8 @@ export async function reconcileOrphans(): Promise<number> {
           [row.id, "status", "orphaned — agetor restarted while this run was active", now],
         );
         db.run(
-          `UPDATE tasks SET "column" = 'ready', run_id = NULL WHERE id = ? AND "column" = 'running'`,
-          [row.task_id],
+          `UPDATE tasks SET "column" = 'ready', run_id = NULL WHERE id = ? AND "column" = 'running' AND run_id = ?`,
+          [row.task_id, row.id],
         );
       }
     });
@@ -869,19 +895,19 @@ export async function reconcileOrphans(): Promise<number> {
         status: "orphaned",
         ts: now,
       });
-      if (row.prevColumn === "running") {
+      if (row.prevColumn === "running" && tasks.get(row.task_id)?.column === "ready") {
         emitGlobal({ kind: "column", taskId: row.task_id, runId: null, column: "ready", prev: row.prevColumn, ts: now });
       }
     }
   }
 
-  // Deliberately NO straggler sweep here. Sessions live on the shared default
-  // tmux socket, so enumerating + killing every un-reattached `agetor-*`
+  // Deliberately NO straggler sweep here. The per-instance tmux socket can
+  // be explicitly shared, so killing every un-reattached `agetor-*`
   // session would reap a sibling instance's (dev vs release DB) or a test
   // run's live sessions. We reattach what we can, orphan the rest in the DB,
   // and leave any unaccounted-for session alive.
   if (reattachedTaskIds.size > 0) {
-    console.log(`[agetor] reattached to ${reattachedTaskIds.size} live tmux session(s)`);
+    console.log(`[agetor] recovered ${reattachedTaskIds.size} CLI execution(s)`);
   }
   if (orphaned.length > 0) {
     console.log(`[agetor] orphaned ${orphaned.length} run(s) with no recoverable session`);
@@ -1289,6 +1315,24 @@ export function isTaskRunLive(taskId: string): boolean {
 }
 
 /**
+ * Done-time follow-up creation may only run after every real execution path
+ * has settled. This deliberately excludes saved drafts/backlog messages:
+ * they are user-owned unsent text, not a queued agent turn. It does include
+ * each one-shot harness queue and interactive cards, which otherwise have no
+ * active run handle during a narrow settle/drain window.
+ */
+export function hasPendingDoneFollowupWork(taskId: string): boolean {
+  if (isTaskRunLive(taskId) || subagents.hasRunning(taskId)) return true;
+  if (listPendingForTask(taskId).length > 0) return true;
+  return Boolean(
+    codexTurnQueue.get(taskId)?.length
+    || cursorTurnQueue.get(taskId)?.length
+    || geminiTurnQueue.get(taskId)?.length
+    || fxTurnQueue.get(taskId)?.length,
+  );
+}
+
+/**
  * True when `taskId`'s current run has been stopped (`stopActiveHandle`
  * flagged its `active` handle `cancelled`) but the handle hasn't been
  * removed from `active` yet — the async window between `kill()` being
@@ -1456,6 +1500,11 @@ async function startTaskInner(
     if (floorError !== null) return { error: floorError };
   }
 
+  // Freeze the task-level opt-in before any preparation or spawn side effect.
+  // This is the sole source of truth for this run; later task PATCHes apply
+  // to a subsequently created run only.
+  const doneFollowupsEnabled = doneFollowupsEnabledForRun(task, harness);
+
   // M6: a worktree-isolated pipeline step task shares its parent's worktree
   // (D2, docs/plans/pipelines.md) — `launchStep` copies `worktreePath`/
   // `branch` straight from the parent row at insert time, and the parent's
@@ -1528,7 +1577,10 @@ async function startTaskInner(
   // pushed things over) are unchanged either way.
   const expandedOverage = promptByteOverage(
     harness.kind,
-    appendReferences(composeLaunchPrompt(effective, expandedPrompt), task.references),
+    promptForDoneFollowups(
+      appendReferences(composeLaunchPrompt(effective, expandedPrompt), task.references),
+      doneFollowupsEnabled,
+    ),
   );
   // Skip re-encoding the same text twice (R19, code review) when expansion
   // was a no-op — a prompt with no `@` tokens at all (or none that resolved)
@@ -1540,7 +1592,10 @@ async function startTaskInner(
     ? expandedOverage
     : promptByteOverage(
       harness.kind,
-      appendReferences(composeLaunchPrompt(effective, task.prompt), task.references),
+      promptForDoneFollowups(
+        appendReferences(composeLaunchPrompt(effective, task.prompt), task.references),
+        doneFollowupsEnabled,
+      ),
     );
   if (expandedOverage && !rawOverage) {
     return {
@@ -1608,6 +1663,7 @@ async function startTaskInner(
       cursorSessionId: null,
       geminiSessionId: null,
       fxSessionId: null,
+      doneFollowupsEnabled,
     });
   });
   persist();
@@ -1623,6 +1679,7 @@ async function startTaskInner(
   // null, so an unbound task's launch prompt is byte-identical to before this
   // feature.
   const promptWithRefs = appendReferences(composeLaunchPrompt(effective, expandedPrompt), task.references);
+  const launchPrompt = promptForDoneFollowups(promptWithRefs, doneFollowupsEnabled);
 
   const onChunk = makeChunkHandler(runId, taskId, harness.kind, task.mode);
   // Echo the initial prompt as a "user" event so the panel renders a
@@ -1637,7 +1694,7 @@ async function startTaskInner(
     taskId,
     runId,
     harness,
-    prompt: promptWithRefs,
+    prompt: launchPrompt,
     cwd: prepared.cwd,
     onChunk,
     onSessionId: (sessionId) => {
@@ -2404,6 +2461,20 @@ function attachDoneHandler(
         : (wasApiError || wasSessionDied || wasUnknownCommand) ? "failed"
         : code === 0 ? "succeeded" : "failed";
       runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: code });
+      // Capture only from the durable main-stream assistant log and never let
+      // an optional follow-up envelope interfere with normal run settlement.
+      // Keeping this before the Review transition means a human who acts as
+      // soon as the card reaches Review always sees the persisted outcome.
+      if (newStatus === "succeeded") {
+        try {
+          collectDoneFollowupsForRun({
+            runId,
+            resolveAgentKind: (candidate) => resolveHarness(candidate.agent)?.kind ?? null,
+          });
+        } catch (err) {
+          console.warn(`[agetor] failed to collect Done follow-ups for run ${runId}:`, err);
+        }
+      }
       // Only flip the task's column when the run that just resolved is
       // still the latest one. If the user pipelined a follow-up while
       // this run was in flight, `task.runId` already points at the
@@ -3585,6 +3656,7 @@ async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Prom
     const priorThreadId = findLastCodexSessionId(taskId);
     const cwd = task.worktreePath ?? task.workdir;
     const harness = resolveHarness(task.agent);
+    const doneFollowupsEnabled = doneFollowupsEnabledForRun(task, harness);
 
     // Pre-flight 1b — before any state mutation (see this function's doc).
     // The `startingTaskIds` claim above is in-memory only and released by the
@@ -3614,6 +3686,7 @@ async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Prom
       cursorSessionId: null,
       geminiSessionId: null,
       fxSessionId: null,
+      doneFollowupsEnabled,
     });
     const prevColumn: ColumnId = task.column;
     tasks.update(taskId, { column: "running", runId: newRunId });
@@ -3642,7 +3715,9 @@ async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Prom
       taskId,
       runId: newRunId,
       harness,
-      prompt: line,
+      // Keep the visible user bubble as their original message; the
+      // server-owned output contract is carried only to the spawned turn.
+      prompt: promptForDoneFollowups(line, doneFollowupsEnabled),
       cwd,
       onChunk,
       onSessionId: (sessionId) => {
@@ -3814,6 +3889,8 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
       cursorSessionId: priorSessionId,
       geminiSessionId: null,
       fxSessionId: null,
+      // Cursor is intentionally out of scope for Done follow-ups.
+      doneFollowupsEnabled: false,
     });
     const prevColumn: ColumnId = task.column;
     tasks.update(taskId, { column: "running", runId: newRunId });
@@ -3992,6 +4069,8 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
       cursorSessionId: null,
       geminiSessionId: priorSessionId,
       fxSessionId: null,
+      // Gemini is intentionally out of scope for Done follow-ups.
+      doneFollowupsEnabled: false,
     });
     const prevColumn: ColumnId = task.column;
     tasks.update(taskId, { column: "running", runId: newRunId });
@@ -4332,6 +4411,8 @@ async function spawnFxRun(
       cursorSessionId: null,
       geminiSessionId: null,
       fxSessionId: priorSessionId,
+      // fx is intentionally out of scope for Done follow-ups.
+      doneFollowupsEnabled: false,
     });
     const prevColumn: ColumnId = task.column;
     tasks.update(taskId, { column: "running", runId: newRunId });
@@ -5179,6 +5260,8 @@ async function sendTurnInExistingSession(
     const newRunId = randomUUID();
     const now = Date.now();
     const inheritedSessionId = findLastClaudeSessionId(taskId);
+    const harness = resolveHarness(task.agent);
+    const doneFollowupsEnabled = doneFollowupsEnabledForRun(task, harness);
     runs.insert({
       id: newRunId,
       taskId,
@@ -5193,6 +5276,7 @@ async function sendTurnInExistingSession(
       cursorSessionId: null,
       geminiSessionId: null,
       fxSessionId: null,
+      doneFollowupsEnabled,
     });
     const prevColumn: ColumnId = task.column;
     tasks.update(taskId, { column: "running", runId: newRunId });
@@ -5200,12 +5284,11 @@ async function sendTurnInExistingSession(
       emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
     }
 
-    const harness = resolveHarness(task.agent);
     const kind: AgentKind = harness?.kind ?? "claude-code";
     const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
     onChunk("user", normalizeUserText(line));
 
-    const agent = await sendTurn(taskId, line, onChunk, {
+    const agent = await sendTurn(taskId, promptForDoneFollowups(line, doneFollowupsEnabled), onChunk, {
       onPasteFailure: (outcome) => handlePasteWithheld(taskId, newRunId, rawLine ?? line, outcome),
     });
     // Stop landed while the paste was in flight (see `pendingCancelRunIds`):
@@ -5404,6 +5487,11 @@ function startContinuationRun(taskId: string): ContinuationHooks | null {
   const newRunId = randomUUID();
   const now = Date.now();
   const inheritedSessionId = findLastClaudeSessionId(taskId);
+  // A continuation has no newly injected prompt. It is the same logical
+  // conversation continuing after background work, so carry the immediately
+  // preceding run's immutable collection policy rather than consulting a
+  // toggle changed mid-conversation.
+  const doneFollowupsEnabled = task.runId ? (runs.get(task.runId)?.doneFollowupsEnabled === true) : false;
   runs.insert({
     id: newRunId,
     taskId,
@@ -5419,6 +5507,7 @@ function startContinuationRun(taskId: string): ContinuationHooks | null {
     geminiSessionId: null,
     fxSessionId: null,
     origin: "continuation",
+    doneFollowupsEnabled,
   });
   const prevColumn: ColumnId = task.column;
   // Continuation turns always pull the card to `running`, regardless of
@@ -5501,6 +5590,8 @@ async function spawnResumedSessionInner(
 ): Promise<{ runId: string; pending?: true }> {
   const priorSessionId = findLastClaudeSessionId(taskId);
   const cwd = task.worktreePath ?? task.workdir;
+  const harness = resolveHarness(task.agent);
+  const doneFollowupsEnabled = doneFollowupsEnabledForRun(task, harness);
 
   const newRunId = randomUUID();
   const now = Date.now();
@@ -5518,6 +5609,7 @@ async function spawnResumedSessionInner(
     cursorSessionId: null,
     geminiSessionId: null,
     fxSessionId: null,
+    doneFollowupsEnabled,
   });
   const prevColumn: ColumnId = task.column;
   tasks.update(taskId, { column: "running", runId: newRunId });
@@ -5525,7 +5617,6 @@ async function spawnResumedSessionInner(
     emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
   }
 
-  const harness = resolveHarness(task.agent);
   const kind: AgentKind = harness?.kind ?? "claude-code";
   const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
   onChunk("user", normalizeUserText(line));
@@ -5554,7 +5645,7 @@ async function spawnResumedSessionInner(
         taskId,
         runId: newRunId,
         harness,
-        prompt: line,
+        prompt: promptForDoneFollowups(line, doneFollowupsEnabled),
         cwd,
         onChunk,
         onSessionId: (sessionId) => {
@@ -5874,6 +5965,25 @@ export async function createTask(
     return { error: `unknown harness "${agentId}"` };
   }
   const kind = harness.kind;
+  // Keep direct/internal callers behind the same scope boundary as HTTP: the
+  // setting exists only on ordinary Codex/Claude Code tasks. The server also
+  // validates the wire type, while this guard keeps non-HTTP callers from
+  // persisting a misleading enabled state.
+  const doneFollowupsEnabled = input.doneFollowupsEnabled === true;
+  if (doneFollowupsEnabled) {
+    const eligibility = isDoneFollowupsEligible(
+      {
+        agent: agentId,
+        pipelineId: pipeline?.id ?? null,
+        pipelineParentId: null,
+        doneFollowupsEnabled,
+      },
+      kind,
+    );
+    if (!eligibility.ok) {
+      return { error: "Done follow-up tasks are available only for ordinary Claude Code or Codex tasks" };
+    }
+  }
   const model = defaultsProfile ? defaultsProfile.model : (input.model ?? DEFAULT_MODEL[kind]);
   // Discovered efforts (e.g. Codex's own app-server catalog) win when the
   // harness reported a non-empty list for this model; the curated
@@ -6027,6 +6137,7 @@ export async function createTask(
     effort,
     fast: defaultsProfile ? defaultsProfile.fast : input.fast === true,
     maxMode: defaultsProfile ? defaultsProfile.maxMode : input.maxMode === true,
+    doneFollowupsEnabled,
     agentProfileId: profile?.id ?? null,
     agentProfile: agentProfileSnapshot,
     // Pipeline binding (D1): only the parent row carries `pipelineId` (set
