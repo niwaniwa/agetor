@@ -72,8 +72,16 @@ export function startWebServer(options: WebOptions) {
       const origin = req.headers.get("origin");
       const upgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
       const mutating = !["GET", "HEAD", "OPTIONS"].includes(req.method);
+      // External links and identity-provider redirects are cross-site navigations.
+      // Admit only the public application shell, never API/auth reads, assets or
+      // embedded documents. The shell has no session data; its API calls still
+      // pass the normal same-origin and authentication checks below.
+      const documentNavigation = req.method === "GET" && !upgrade &&
+        (url.pathname === "/" || url.pathname === "/index.html") &&
+        req.headers.get("sec-fetch-mode") === "navigate" &&
+        req.headers.get("sec-fetch-dest") === "document";
       if ((origin !== null && origin !== expectedOrigin) || ((mutating || upgrade) && origin !== expectedOrigin) ||
-          req.headers.get("sec-fetch-site") === "cross-site") return json({ error: "Same-origin request required" }, 403);
+          (req.headers.get("sec-fetch-site") === "cross-site" && !documentNavigation)) return json({ error: "Same-origin request required" }, 403);
       // The public cookie cannot be planted by a sibling subdomain with Domain=.
       // Keep the existing name for local HTTP sessions, where Secure is unavailable.
       const cookieName = `${isPublic ? "__Host-" : ""}kaname_session_${server.port}`;

@@ -138,6 +138,67 @@ test("the public application loads, but API and SSE require a browser session", 
   }
 });
 
+const externalNavigation = {
+  "sec-fetch-site": "cross-site",
+  "sec-fetch-mode": "navigate",
+  "sec-fetch-dest": "document",
+};
+
+test("external links and access redirects can open only the public application document", async () => {
+  for (const [address, host] of [[base(), new URL(base()).host], [publicBase(), new URL(publicOrigin).host]]) {
+    for (const route of ["/", "/index.html", "/?from=access"]) {
+      const response = await fetch(`${address}${route}`, { headers: { ...externalNavigation, host: host! } });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toContain("text/html");
+      expect(response.headers.get("set-cookie")).toBeNull();
+      expect(response.headers.get("x-frame-options")).toBe("DENY");
+      expect(response.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+      expect(await response.text()).toContain("KANAME fixture");
+    }
+  }
+});
+
+test("external document navigation never bypasses API, session, static asset or Host boundaries", async () => {
+  const { cookie } = await publicLogin();
+  const requestHeaders = { ...externalNavigation, host: new URL(publicOrigin).host, cookie };
+  for (const route of ["/api", "/api/tasks", "/api/events", "/auth/session", "/auth/login", "/auth/logout", "/asset.js"]) {
+    const response = await fetch(`${publicBase()}${route}`, { headers: requestHeaders });
+    expect(response.status).toBe(403);
+    expect(response.headers.get("set-cookie")).toBeNull();
+  }
+  expect((await fetch(publicBase(), { headers: { ...requestHeaders, host: "evil.invalid" } })).status).toBe(403);
+  expect((await fetch(base(), { headers: requestHeaders })).status).toBe(403);
+});
+
+test("cross-site subresources and embedded documents cannot use the application navigation exception", async () => {
+  const host = new URL(publicOrigin).host;
+  for (const overrides of [
+    { "sec-fetch-mode": "cors", "sec-fetch-dest": "empty" },
+    { "sec-fetch-mode": "no-cors", "sec-fetch-dest": "script" },
+    { "sec-fetch-mode": "navigate", "sec-fetch-dest": "iframe" },
+    { "sec-fetch-mode": "navigate", "sec-fetch-dest": "frame" },
+    { "sec-fetch-mode": "navigate", "sec-fetch-dest": "object" },
+    { "sec-fetch-mode": "", "sec-fetch-dest": "" },
+  ]) {
+    expect((await fetch(publicBase(), { headers: { ...externalNavigation, ...overrides, host } })).status).toBe(403);
+  }
+});
+
+test("the navigation exception keeps Origin, mutation and WebSocket checks strict", async () => {
+  const host = new URL(publicOrigin).host;
+  for (const origin of ["https://evil.invalid", "null", publicBase()]) {
+    expect((await fetch(publicBase(), { headers: { ...externalNavigation, host, origin } })).status).toBe(403);
+  }
+  for (const method of ["HEAD", "OPTIONS", "POST", "PUT", "DELETE"]) {
+    expect((await fetch(publicBase(), { method, headers: { ...externalNavigation, host, origin: publicOrigin } })).status).toBe(403);
+  }
+  const upgrade = await fetch(publicBase(), { headers: {
+    ...externalNavigation, host, origin: publicOrigin, connection: "Upgrade", upgrade: "websocket",
+    "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==", "sec-websocket-version": "13",
+  } });
+  expect(upgrade.status).toBe(403);
+});
+
 test("browser credentials and persisted sessions are private to the service user", () => {
   expect(statSync(path.join(dataDir, "web-login-token")).mode & 0o777).toBe(0o600);
   expect(statSync(path.join(dataDir, "web-sessions.sqlite")).mode & 0o777).toBe(0o600);

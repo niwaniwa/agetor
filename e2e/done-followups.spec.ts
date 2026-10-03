@@ -139,6 +139,21 @@ test.describe("Done follow-up tasks", () => {
       await expect(reviewPanel.getByTestId("done-followups-panel")).toBeVisible();
       await expect(reviewPanel.getByTestId("done-followups-candidates")).toContainText("Fake follow-up 1");
       await expect(reviewPanel.getByText("Nothing is created until you mark this task Done.")).toBeVisible();
+      const output = reviewPanel.getByTestId("done-followups-output");
+      await expect(output).toBeVisible();
+      await expect(output).toContainText("追加タスクの提案 · 2 件");
+      await expect(output).toContainText("Fake follow-up 1");
+      await expect(output).toContainText("候補の保存・起票状況");
+      // The wire envelope is available for inspection but stays collapsed in
+      // the conversation until explicitly requested. It is never HTML.
+      const original = output.getByTestId("done-followups-original");
+      await expect(original.locator("pre")).not.toBeVisible();
+      await original.locator("summary").click();
+      await expect(original.locator("pre")).toContainText("<kaname-followups>");
+      await expect(reviewPanel.locator("kaname-followups")).toHaveCount(0);
+      await original.locator("summary").click();
+      await expect(original.locator("pre")).not.toBeVisible();
+      expect((await getSummary(request, backend, source.id)).generated).toHaveLength(0);
       await closeTask(reviewPanel);
 
       // This is the actual browser Done control; it is deliberately not an
@@ -238,9 +253,12 @@ test.describe("Done follow-up tasks", () => {
 
       const zeroPanel = await openTask(page, zeroTitle);
       await expect(zeroPanel.getByTestId("done-followups-zero")).toBeVisible();
+      await expect(zeroPanel.getByTestId("done-followups-output")).toContainText("追加タスクの提案はありません。");
       await closeTask(zeroPanel);
       const invalidPanel = await openTask(page, invalidTitle);
       await expect(invalidPanel.getByTestId("done-followups-collection-failed")).toBeVisible();
+      await expect(invalidPanel.getByTestId("done-followups-output")).toHaveCount(0);
+      await expect(invalidPanel.getByText(/<kaname-followups>/)).toBeVisible();
       await closeTask(invalidPanel);
 
       for (const id of createdTaskIds) {

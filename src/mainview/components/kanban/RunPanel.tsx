@@ -14,6 +14,7 @@ import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sort
 import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
+import { doneFollowupsPreview, doneFollowupsPreviewRunIds } from "@/lib/done-followups-preview";
 import { EXPAND_EVENT, isExpandTargetFor } from "@/lib/expand-on-jump";
 import { latestPrProposal } from "@/lib/pr-proposal";
 import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-url";
@@ -40,6 +41,7 @@ import {
 import { reconcileById } from "@/lib/reconcile";
 import { RUN_PANEL_DEFAULT_WIDTH, RUN_PANEL_MIN_WIDTH, clampPanelWidth, readPanelWidth, writePanelWidth } from "@/lib/panel-width";
 import { QuoteSelectionButton } from "./QuoteSelectionButton";
+import { DoneFollowupsOutput } from "./DoneFollowupsOutput";
 import type { GitHubPullPrefill } from "./GitHubDialog";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
@@ -4015,6 +4017,7 @@ function RunPanelBody({
               </div>
               <RunEventList
                 events={displayedEvents}
+                runs={runs}
                 stickyUserMessages={stickyUserMessages}
                 interactions={interactions}
                 onInteractionResolved={dismissInteraction}
@@ -5126,6 +5129,7 @@ type RunIndicatorMode = "off" | "active";
 
 function RunEventList({
   events,
+  runs,
   stickyUserMessages,
   interactions = [],
   onInteractionResolved,
@@ -5142,6 +5146,7 @@ function RunEventList({
   pathRoots,
 }: {
   events: RunEvent[];
+  runs: readonly Run[];
   /** True groups turns and pins each user message for its own response. */
   stickyUserMessages: boolean;
   interactions?: PendingInteraction[];
@@ -5219,6 +5224,10 @@ function RunEventList({
   // runs renders as ugly prefixed text while only the in-flight events get
   // proper cards.
   const normalised = useMemo(() => events.map(normalizeLegacyEvent), [events]);
+  // Only immutable opt-in membership affects previews. Key on it so an
+  // unrelated run metadata update does not invalidate every Markdown block.
+  const followupRunSignature = JSON.stringify(runs.filter((run) => run.doneFollowupsEnabled === true).map((run) => run.id).sort());
+  const previewableFollowupRuns = useMemo(() => doneFollowupsPreviewRunIds(events, runs), [events, followupRunSignature]);
 
   // Full markdown for the plan `TmuxPromptCard`'s plan branch is about to
   // act on — the source of truth is the task's latest PENDING claude plan
@@ -5383,7 +5392,7 @@ function RunEventList({
             ),
           ];
         case "assistant":
-          return [wrap(key, evid, <AssistantBlock text={e.data} />)];
+          return [wrap(key, evid, <AssistantBlock text={e.data} previewFollowups={e.subagentId == null && previewableFollowupRuns.has(e.runId)} />)];
         case "thinking":
           return [wrap(key, evid, <ThinkingBlock text={e.data} />)];
         case "tool_use": {
@@ -5530,7 +5539,7 @@ function RunEventList({
     // finished") spill out at the bottom.
     out.push(...(interactionByIndex.get(normalised.length) ?? []).map(renderInteraction));
     return out;
-  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, pathRoots, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId, stickyUserMessages]);
+  }, [normalised, previewableFollowupRuns, interactionByIndex, resultByToolId, onInteractionResolved, taskId, pathRoots, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId, stickyUserMessages]);
 
   // Scopes every `MdImage` under this list (assistant/user bubbles, tagged
   // segments, the plan-approval preview) to this task's id + roots without
@@ -6097,7 +6106,8 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
   );
 });
 
-const AssistantBlock = memo(function AssistantBlock({ text }: { text: string }) {
+const AssistantBlock = memo(function AssistantBlock({ text, previewFollowups }: { text: string; previewFollowups: boolean }) {
+  const preview = previewFollowups ? doneFollowupsPreview(text) : null;
   return (
     <div className="agetor-md text-foreground">
       <ReactMarkdown
@@ -6105,8 +6115,9 @@ const AssistantBlock = memo(function AssistantBlock({ text }: { text: string }) 
         components={ASSISTANT_MD_COMPONENTS}
         urlTransform={MD_URL_TRANSFORM}
       >
-        {text}
+        {preview ? preview.before : text}
       </ReactMarkdown>
+      {preview && <DoneFollowupsOutput candidates={preview.candidates} original={text} />}
     </div>
   );
 });
