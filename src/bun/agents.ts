@@ -20,6 +20,8 @@ import { spawnGeminiViaTmux } from "./gemini-tmux.ts";
 import { answerFxPermission, registerFxPermission } from "./interactions.ts";
 import { gitWritableRoots } from "./worktree.ts";
 import { DONE_FOLLOWUPS_PROMPT_MARKER } from "./done-followups.ts";
+import { CLAUDE_MODEL_FLAG, toClaudeModelArg } from "../shared/claude-model-arg.ts";
+export { toClaudeModelArg } from "../shared/claude-model-arg.ts";
 
 export type { SpawnedAgent };
 
@@ -147,37 +149,6 @@ export interface AgentRunOptions {
    * kind ignores this field entirely.
    */
   continueRecovery?: boolean;
-}
-
-// Map friendly model ids to the exact strings the claude-code CLI expects.
-// Unknown ids are passed through verbatim (so a user can type a model the
-// curated list doesn't know about yet). Codex accepts the friendly ids as-is
-// so it doesn't need a translation table.
-const CLAUDE_MODEL_FLAG: Record<string, string> = {
-  "mythos-5.1": "claude-mythos-5-1",
-  "fable-5.1": "claude-fable-5-1",
-  "mythos-5": "claude-mythos-5",
-  "fable-5": "claude-fable-5",
-  "opus-5.5": "claude-opus-5-5",
-  "opus-5": "claude-opus-5",
-  "opus-4.8": "claude-opus-4-8",
-  "opus-4.7": "claude-opus-4-7",
-  "opus-4.6": "claude-opus-4-6",
-  "sonnet-5.5": "claude-sonnet-5-5",
-  "sonnet-5": "claude-sonnet-5",
-  "sonnet-4.6": "claude-sonnet-4-6",
-  "haiku-4.5": "claude-haiku-4-5",
-};
-
-/**
- * Map a friendly claude-code model id (from AGENT_OPTIONS) to the exact
- * string the CLI / `/model` slash command wants. Unknown ids fall through
- * verbatim so a future curated entry "just works" until the table catches
- * up. Exported because the orchestrator needs the same translation when
- * issuing `/model <id>` to a live session.
- */
-export function toClaudeModelArg(id: string): string {
-  return CLAUDE_MODEL_FLAG[id] ?? id;
 }
 
 /**

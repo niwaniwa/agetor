@@ -1,5 +1,6 @@
 import { browserMode, createTransport, reportUnauthorized, watchConnection } from "./transport";
 import { toast } from "sonner";
+import type { DevelopmentIssue, WorkflowDetail, WorkflowProjectSettings, WorkflowSettings, WorkflowNotification, WorkflowHumanRequest, WorkflowBudgetSummary, WorkflowCreateInput, WorkflowMutation, WorkflowAnswerInput, WorkflowApprovalInput } from "../../shared/development-workflow.ts";
 import type {
   AgentKind,
   AgentProfile,
@@ -396,6 +397,32 @@ async function j<T>(
 }
 
 export interface AppDefaults { home: string; cwd: string; dataDir: string }
+
+/** Durable development issues use the same authenticated browser transport. */
+export const workflowApi = {
+  list: () => j<DevelopmentIssue[]>("/workflow/issues"),
+  detail: (id: string) => j<WorkflowDetail>(`/workflow/issues/${encodeURIComponent(id)}`),
+  create: (input: WorkflowCreateInput) => j<DevelopmentIssue>("/workflow/issues", { method: "POST", body: JSON.stringify(input) }, { retry: false }),
+  action: (id: string, action: "ready" | "stop" | "resume" | "cancel", input: WorkflowMutation) => j<DevelopmentIssue>(`/workflow/issues/${encodeURIComponent(id)}/${action}`, { method: "POST", body: JSON.stringify(input) }, { retry: false }),
+  answer: (id: string, requestId: string, input: WorkflowAnswerInput) => j<DevelopmentIssue>(`/workflow/issues/${encodeURIComponent(id)}/requests/${encodeURIComponent(requestId)}/answer`, { method: "POST", body: JSON.stringify(input) }, { retry: false }),
+  approve: (id: string, input: WorkflowApprovalInput) => j<DevelopmentIssue>(`/workflow/issues/${encodeURIComponent(id)}/approve`, { method: "POST", body: JSON.stringify(input) }, { retry: false }),
+  changes: (id: string, input: WorkflowAnswerInput) => j<DevelopmentIssue>(`/workflow/issues/${encodeURIComponent(id)}/changes`, { method: "POST", body: JSON.stringify(input) }, { retry: false }),
+  project: (path: string) => j<WorkflowProjectSettings>(`/workflow/projects?path=${encodeURIComponent(path)}`),
+  saveProject: (input: WorkflowProjectSettings) => j<WorkflowProjectSettings>("/workflow/projects", { method: "PUT", body: JSON.stringify(input) }, { retry: false }),
+  settings: () => j<WorkflowSettings>("/workflow/settings"),
+  saveSettings: (input: WorkflowSettings) => j<WorkflowSettings>("/workflow/settings", { method: "PUT", body: JSON.stringify(input) }, { retry: false }),
+  inbox: () => j<WorkflowHumanRequest[]>("/workflow/inbox"),
+  notifications: () => j<WorkflowNotification[]>("/workflow/notifications"),
+  budget: () => j<WorkflowBudgetSummary>("/workflow/budget"),
+  logs: (id: string, attemptId: string) => j<{ logs: string }>(`/workflow/issues/${encodeURIComponent(id)}/attempts/${encodeURIComponent(attemptId)}/logs`),
+  diff: (id: string) => j<{ diff: string }>(`/workflow/issues/${encodeURIComponent(id)}/diff`),
+  subscribe(onUpdate: () => void) {
+    const source = new EventSource(transport.url("/workflow/events"));
+    source.addEventListener("update", onUpdate);
+    source.onopen = onUpdate;
+    return () => source.close();
+  },
+};
 
 /** One page of older task events, as returned by `GET /tasks/:id/events/page`
  *  (the "Load earlier" backward-paging cursor). Ascending order (oldest

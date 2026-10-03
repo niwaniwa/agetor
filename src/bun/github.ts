@@ -174,6 +174,8 @@ interface ReviewGitHubPullInput extends GitHubItemNumberInput {
 
 interface MergeGitHubPullInput extends GitHubItemNumberInput {
   method: GitHubPullMergeMethod;
+  /** Optimistic concurrency guard for an approval bound to a specific commit. */
+  expectedHeadSha?: string;
   title?: string;
   message?: string;
 }
@@ -2457,6 +2459,9 @@ export async function mergeGitHubPull(input: MergeGitHubPullInput): Promise<GitH
   if (input.method !== "merge" && input.method !== "squash" && input.method !== "rebase") {
     return { ok: false, error: "unsupported merge method" };
   }
+  if (input.expectedHeadSha !== undefined && !/^[a-f0-9]{40}$/i.test(input.expectedHeadSha)) {
+    return { ok: false, error: "expected head SHA must be a full commit SHA" };
+  }
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to merge" };
@@ -2469,6 +2474,7 @@ export async function mergeGitHubPull(input: MergeGitHubPullInput): Promise<GitH
       method: "PUT",
       body: JSON.stringify({
         merge_method: input.method,
+        ...(input.expectedHeadSha ? { sha: input.expectedHeadSha } : {}),
         ...(input.title?.trim() ? { commit_title: input.title.trim() } : {}),
         ...(input.message?.trim() ? { commit_message: input.message.trim() } : {}),
       }),

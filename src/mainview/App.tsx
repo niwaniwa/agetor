@@ -47,6 +47,7 @@ import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/ka
 import { useAgentProfiles } from "@/lib/agent-profiles";
 import { usePipelines } from "@/lib/pipelines";
 import { PipelineEditor, PipelinesPage, PipelineRunView } from "@/components/pipelines";
+import { DevelopmentWorkflowsPage } from "@/components/workflows/DevelopmentWorkflowsPage";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { FontSizeProvider, useFontSize } from "@/components/font-size-provider";
 import { ThemeProvider, useTheme } from "@/components/theme-provider";
@@ -194,6 +195,7 @@ const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
  */
 type AppView =
   | { kind: "board" }
+  | { kind: "development-workflows" }
   | { kind: "pipelines"; pipelineId: string | null; editing: boolean }
   | { kind: "pipeline-run"; taskId: string };
 
@@ -2059,6 +2061,13 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             <Workflow className="size-4" />
           </Button>
           <Button
+            variant={view.kind === "development-workflows" ? "secondary" : "ghost"}
+            data-testid="development-workflows-button"
+            onClick={() => navigate({ kind: "development-workflows" })}
+          >
+            開発ワークフロー
+          </Button>
+          <Button
             variant="ghost"
             size="icon"
             onClick={() => setSettingsOpen(true)}
@@ -2236,6 +2245,9 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
               </motion.div>
             )}
 
+            {view.kind === "development-workflows" && (
+              <DevelopmentWorkflowsPage projects={projects} profiles={profiles} onBack={() => setView({ kind: "board" })} />
+            )}
             {view.kind === "pipelines" && !view.editing && (
               <motion.div
                 key="pipelines-list"

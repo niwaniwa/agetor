@@ -1,3 +1,6 @@
+import { handleDevelopmentWorkflowRequest, isDevelopmentWorkflowPull } from "./workflow-runtime.ts";
+import type { WorkflowEngine } from "./workflow-engine.ts";
+import { createWorkflowApi } from "./workflow-api.ts";
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
@@ -856,8 +859,9 @@ const notAvailableHeadless = (req: Request) =>
     { status: 501, headers: corsHeaders(req) },
   );
 
-export function startApiServer(deps: { native?: ApiNative } = {}) {
+export function startApiServer(deps: { native?: ApiNative; workflow?: WorkflowEngine } = {}) {
   const native = deps.native;
+  const workflowHandler = deps.workflow ? createWorkflowApi(deps.workflow) : handleDevelopmentWorkflowRequest;
   // Read the port fresh — supports tests that import server.ts after setting
   // AGETOR_API_PORT and rely on the bind to honour their override even when
   // a sibling test file imported the module first.
@@ -2342,6 +2346,9 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "valid merge method required" }, { status: 400, headers: corsHeaders(req) });
           }
           const mergeMethod = (body.mergeMethod as GitHubPullMergeMethod | undefined) ?? "merge";
+          if (body.enable && await isDevelopmentWorkflowPull(dir, rawNumber)) {
+            return json({ error: "This PR is managed by a development workflow. Approve its current SHA in the workflow view." }, { status: 409, headers: corsHeaders(req) });
+          }
           const result = await setGitHubPullAutoMerge({ dir, number: rawNumber, enable: body.enable, mergeMethod });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
@@ -2527,6 +2534,9 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "valid merge method required" }, { status: 400, headers: corsHeaders(req) });
           }
           const method = body.method as GitHubPullMergeMethod;
+          if (await isDevelopmentWorkflowPull(dir, rawNumber)) {
+            return json({ error: "This PR is managed by a development workflow. Approve its current SHA in the workflow view." }, { status: 409, headers: corsHeaders(req) });
+          }
           const result = await gitHost.pullMerge({
             dir,
             number: rawNumber,
@@ -7034,6 +7044,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // can't upgrade, so we match it here. Token-gated via `?token=` like the
       // SSE endpoints (WebSockets can't set the Authorization header).
       const url = new URL(req.url);
+      if (url.pathname.startsWith("/workflow/")) {
+        return authed(async (request: Request) => {
+          const response = await workflowHandler(request);
+          const headers = new Headers(response.headers);
+          for (const [key, value] of Object.entries(corsHeaders(request))) headers.set(key, value);
+          return new Response(response.body, { status: response.status, headers });
+        })(req);
+      }
       const wsMatch = url.pathname.match(/^\/terminals\/([^/]+)\/ws$/);
       if (wsMatch) {
         if (!isAuthorized(req)) return unauthorized(req);

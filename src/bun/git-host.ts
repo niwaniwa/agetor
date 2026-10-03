@@ -649,6 +649,7 @@ export interface PullMergeInput {
   dir: string;
   number: number;
   method: GitHubPullMergeMethod;
+  expectedHeadSha?: string;
   title?: string;
   message?: string;
 }
@@ -657,6 +658,7 @@ export async function pullMerge(input: PullMergeInput): Promise<MergeResponse> {
   const repoInfo = await providerRepoForDir(input.dir);
   if (!repoInfo) return { ok: false, error: NO_REMOTE_ERROR };
   if (repoInfo.provider === "github") return mergeGitHubPull(input);
+  if (input.expectedHeadSha) return { ok: false, error: "SHA-bound merge is currently supported only for GitHub" };
   return repoInfo.provider === "gitlab"
     ? mergeGitLabPull(repoInfo, input.number, input.method)
     : mergeBitbucketPull(repoInfo, input.number, input.method);

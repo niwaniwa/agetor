@@ -1,21 +1,24 @@
 # KANAME ドキュメント
 
-更新日: 2026-10-02
+更新日: 2026-10-03
 
 KANAME の要件整理、agetor の調査、実装計画、開発作業の制約を保存するディレクトリ。
 
 ## 要件と実装計画
 
+- [単一担当の開発ワークフロー](single-assignee-workflow.md): 調査・要件整理から実装、実コマンドでの検証、自己レビュー、PR、SHA 承認、Squash マージ確認までを実装。2026-10-02 に分離環境で検証済み、稼働版は未反映。今回の確定仕様・操作方法・検証結果を記録する。
 - [基盤 PoC の実装・起動・検証](foundation-poc.md): Linux headless、ブラウザー認証、CLI 制御、再接続・再起動時の復旧。2026-09-30 にユーザー確認済み。第15節の後続要件と今回の到達点を区別して記録する。
 - [完了時の追加タスク起票](done-followups-spec.md): タスクごとに ON（初期 OFF）、人が Done にした時に Backlog へ起票する。実ブラウザーと両実 CLI の確認を経て、2026-10-02 に稼働版へ反映済み。
 - [完了時の追加タスク起票 — 実装・検証記録](done-followups-implementation.md): 仕様との対応、変更ファイル、検証結果と再レビュー。
 - [完了時の追加タスク起票 — 稼働版への反映](done-followups-deployment.md): バックアップ、データ保持、再起動、稼働画面の確認結果と利用方法。
 - [Cloudflare 経由の接続](cloudflare-access.md): `kaname.niri.la` の公開ホスト対応、Docker 内の Tunnel からの接続経路と設定・検証記録。
 - [要件・設計・実装計画](implementation-plan.md): 会話で確定した方針、agetor の再利用範囲、Issue と Agent の実行フロー、受け入れ条件、未確定事項。
-- [依頼の受付と通知と利用上限](implementation-plan.md#15-依頼の受付と通知と利用上限): 2026-09-30 に採用した動作と受け入れ条件。重要な未決事項だけ質問し、外部通知一種類を追加。累積稼働時間は親 Issue ごと2時間・全体で一日6時間を変更可能な試用初期値とする。通知先のサービス・宛先は未指定。
+- [依頼の受付と通知と利用上限](implementation-plan.md#15-依頼の受付と通知と利用上限): 2026-09-30 の採用方針。2026-10-02 の今回実装では通知を画面内に限定し、親 Issue ごと2時間・全体で一日6時間の上限は新ワークフローを対象とした。詳細は上記の最新仕様を参照する。
 - 元の構想資料: 隣接する `kaname` リポジトリの `.docs/agent-system.md`（現環境では `/home/nirila/project/kaname/.docs/agent-system.md`）。
 
 最新の決定は **「親 Issue ごとに一つの PR」**。Agent の細かな分担は内部タスクとして表示し、子 Issue は独立して追跡する必要がある場合だけ作成する。子の成果も親の PR に統合する。
+
+単一担当の段階では一件の依頼を同じ CLI・モデル・effort が順に処理する。内部委譲は無効化し、Ready で実行を許可、マージには対象 SHA の承認を別に求める。既存 Task／Pipeline と新しい開発ワークフローは別の実行管理を使う。
 
 ユーザーの fork の checkout は `/home/nirila/project/agetor` に存在し、origin は `git@github.com:niwaniwa/agetor.git`。調査時の upstream 基準は `19fcc12503716f4625598c679849274564d8b131`。基盤 PoC を実 Codex／Claude Code とブラウザーで検証し、Done 時の追加タスク起票と Cloudflare 経由の接続まで稼働版へ反映した。2026-10-02 のユーザー指示により、この状態をローカルの基準コミットとして保存する。個別の検証結果と残課題は上記の各記録を参照する。
 

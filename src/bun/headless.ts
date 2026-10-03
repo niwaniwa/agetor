@@ -18,6 +18,7 @@ import {
 import { daemonLog } from "./daemon-log.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
+import { startDevelopmentWorkflows, stopDevelopmentWorkflowScheduler, hasDevelopmentWorkflowWork } from "./workflow-runtime.ts";
 
 /**
  * Headless Agetor core — the same Bun server + orchestrator the desktop app
@@ -76,6 +77,7 @@ function hasRunningRuns(): boolean {
  *  background agents/workflows (subagent rows started within
  *  `SUBAGENT_HOLD_MAX_MS`). Exported for tests. */
 export function hasRunningWork(): boolean {
+  if (hasDevelopmentWorkflowWork()) return true;
   if (hasRunningRuns()) return true;
   try {
     return subagents.hasAnyRunning(Date.now() - SUBAGENT_HOLD_MAX_MS);
@@ -112,6 +114,7 @@ function shutdown(reason: string, code = 0): void {
   // not touch any persisted `fxRecovery` row — `rearmFxAutoResumes()` re-arms
   // them from the DB on the next boot.
   stopFxAutoResumeTimers();
+  stopDevelopmentWorkflowScheduler();
   try {
     removeCoreCreds(dataDir);
   } catch {
@@ -155,6 +158,7 @@ export async function runDaemon(options: DaemonOptions = {}): Promise<ReturnType
   // reconcileOrphans() resolves every step task's own orphan→ready
   // transition. `daemonLog`, not `console.log` — see the rearm comment below.
   const reconciledPipelineRunCount = await reconcilePipelineRuns();
+  await startDevelopmentWorkflows();
   if (reconciledPipelineRunCount > 0) {
     daemonLog(`reconciled ${reconciledPipelineRunCount} pipeline run(s)`);
   }
